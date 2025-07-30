@@ -17,6 +17,7 @@ import warnings
 import zipfile
 import urllib.request
 import urllib.parse
+from urllib.error import URLError
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -322,12 +323,26 @@ class Metadata:
 
         # -------- procesamiento principal --------
         if isinstance(meta_source, (str, pathlib.Path)) and str(meta_source).lower().endswith(".zip"):
-            # ---------------- ZIP (solo local) ----------------
-            src_zip = pathlib.Path(meta_source)
-            if _is_url(src_zip):
-                raise RuntimeError("El soporte para ZIP remotos no está habilitado.")
-            if not src_zip.exists():
-                raise FileNotFoundError(src_zip)
+            # ---------------- ZIP local o remoto ----------------
+            src_zip = pathlib.Path(str(meta_source))
+            tmp_path: Optional[pathlib.Path] = None
+
+            if _is_url(meta_source):
+                if inplace:
+                    raise RuntimeError("No se puede sobrescribir un recurso HTTP; usa inplace=False.")
+                if verbose:
+                    print(f"[update] Descargando {meta_source}...")
+                try:
+                    with urllib.request.urlopen(str(meta_source)) as resp:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+                            tmp.write(resp.read())
+                            tmp_path = pathlib.Path(tmp.name)
+                    src_zip = tmp_path
+                except URLError as e:
+                    raise RuntimeError(f"Error al descargar {meta_source}: {e.reason}") from e
+            else:
+                if not src_zip.exists():
+                    raise FileNotFoundError(src_zip)
 
             updated: Dict[str, bytes] = {}
             with zipfile.ZipFile(src_zip, "r") as zin:
@@ -339,7 +354,10 @@ class Metadata:
                     meta = _handle_meta(meta)
                     updated[fname] = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).encode()
 
-            dst_zip = src_zip if inplace else pathlib.Path(output or src_zip.with_name(src_zip.stem + "_updated.zip"))
+            if _is_url(meta_source):
+                dst_zip = pathlib.Path(output or tempfile.gettempdir()) / src_zip.name
+            else:
+                dst_zip = src_zip if inplace else pathlib.Path(output or src_zip.with_name(src_zip.stem + "_updated.zip"))
             if dst_zip.exists() and not overwrite:
                 raise FileExistsError(dst_zip)
             with zipfile.ZipFile(dst_zip, "w") as zout:
@@ -347,6 +365,11 @@ class Metadata:
                     zout.writestr(fname, data)
             if verbose:
                 print(f"✔ ZIP escrito en {dst_zip}")
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
         else:
             files = [meta_source] if isinstance(meta_source, (str, pathlib.Path)) else meta_source
