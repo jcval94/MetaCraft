@@ -632,13 +632,22 @@ class Metadata:
                             model=llm_kwargs.get("model", "gpt-4o-mini"))
 
     def quality_report(self,
+                       df: Optional[pd.DataFrame] = None,
                        *,
                        baseline: Optional[str] = None,
                        weights: Optional[Dict[str, float]] = None,
                        message: bool = True) -> Dict[str, Any]:
+        """Devuelve una puntuación de calidad según los datos validados."""
         self._ensure_loaded()
         weights = weights or {"completeness": .6, "drift": .4}
-        comp_pass = self.validate(pd.DataFrame({}), detail=2, message=False)
+
+        if df is None:
+            df = self._df_cache
+            if df is None:
+                warnings.warn("[quality_report] No DataFrame en caché ni provisto.")
+
+        df_val = df if df is not None else pd.DataFrame({})
+        comp_pass = self.validate(df_val, detail=2, message=False)
         completeness = 1.0 if comp_pass else 0.5
         drift_score  = 1.0
         if baseline:
