@@ -84,6 +84,24 @@ m.update(df, 'https://ejemplo.com/esquemas.zip', verbose=True)
 ```
 Esto descargará el ZIP a un directorio temporal, aplicará las actualizaciones y dejará el archivo resultante en la misma carpeta (o en la ruta indicada con `output`).
 
+### Edición de metadatos vía `metadata.df`
+
+Tras `m.update()` el esquema queda en `m.df`, un DataFrame editable. Los cambios
+pueden propagarse al YAML con `m.df.upgrade()`:
+
+```python
+# 1) Si todas las columnas son enteros
+m.df['type.logical_type'] = 'integer'
+
+# 2) Cambiar la descripción de `age`
+m.df.loc['age', 'identity.description_i18n.es'] = 'Edad del pasajero'
+
+# 3) Ajustar el rango permitido de `age`
+m.df.loc['age', ['domain.numeric.min', 'domain.numeric.max']] = [0, 120]
+
+m.df.upgrade('schema.yaml')  # guarda el YAML actualizado
+```
+
 ## Roadmap
 
 - ✔️ Soporte de YAML remoto (v 2025‑07‑30)
