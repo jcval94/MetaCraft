@@ -1,24 +1,34 @@
-# metadata.py — versión 2025‑07‑28 (refactor a clase Metadata)
-# ===========================================================
+# metadata.py — versión 2025‑07‑30 (soporta YAML remotos)
+# ==============================================================
 #  ✦ Módulo unificado de metadatos con:
 #    • update · printSchema · info · describe (con validate previo)
 #    • validate · compare · export_schema · generate_expectations
 #    • quality_report · transform · snapshot / load_snapshot / list_snapshots
 #    • research (IA)
-# -----------------------------------------------------------
-import base64, json, os, pathlib, re, tempfile, warnings, zipfile
+# --------------------------------------------------------------
+import base64
+import json
+import os
+import pathlib
+import re
+import tempfile
+import unicodedata
+import warnings
+import zipfile
+import urllib.request
+import urllib.parse
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-from pandas.api.types import CategoricalDtype
 
 import numpy as np
 import pandas as pd
 import yaml
+from pandas.api.types import CategoricalDtype
 
 # ---------- dependencias opcionales ----------
 try:
     import openai
-except ImportError:                              # se inicializa solo si hay key
+except ImportError:                                 # se inicializa solo si hay key
     openai = None
 
 try:
@@ -31,12 +41,39 @@ try:
 except ImportError:
     HyperLogLog = None
 # ---------------------------------------------
+
+
+# ╔════════════════════════════════════════════╗
+# ║ Helpers para fuentes locales y remotas     ║
+# ╚════════════════════════════════════════════╝
+def _is_url(src: Union[str, pathlib.Path]) -> bool:
+    """Devuelve True si la ruta apunta a un recurso http(s)."""
+    return isinstance(src, (str, pathlib.Path)) and str(src).lower().startswith(("http://", "https://"))
+
+
+def _read_yaml(src: Union[str, pathlib.Path]) -> Dict[str, Any]:
+    """
+    Lee un YAML desde disco o desde una URL y lo devuelve como dict.
+    Lanza FileNotFoundError / URLError si el recurso no existe.
+    """
+    if _is_url(src):
+        with urllib.request.urlopen(str(src)) as resp:
+            data = resp.read().decode("utf-8")
+        return yaml.safe_load(data)
+    else:
+        path = pathlib.Path(src)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def _tdigest_b64(series: pd.Series) -> Optional[str]:
     if TDigest is None or not pd.api.types.is_numeric_dtype(series):
         return None
     t = TDigest()
     t.batch_update(series.dropna().astype(float))
     return base64.b64encode(json.dumps(t.to_dict()).encode()).decode()
+
 
 def _hll(series: pd.Series, p: int = 14) -> Optional[int]:
     if HyperLogLog is None:
@@ -46,30 +83,36 @@ def _hll(series: pd.Series, p: int = 14) -> Optional[int]:
         hll.update(str(x).encode())
     return int(hll.count())
 
-def _infer_logic(series: pd.Series) -> str:
-    dtype = series.dtype          # evitamos llamar varias veces
 
-    if pd.api.types.is_bool_dtype(dtype):          return "boolean"
-    if pd.api.types.is_integer_dtype(dtype):       return "integer"
-    if pd.api.types.is_float_dtype(dtype):         return "float"
-    if pd.api.types.is_datetime64_any_dtype(dtype):return "datetime"
-    if isinstance(dtype, CategoricalDtype):        return "categorical"
+def _infer_logic(series: pd.Series) -> str:
+    dtype = series.dtype
+
+    if pd.api.types.is_bool_dtype(dtype):
+        return "boolean"
+    if pd.api.types.is_integer_dtype(dtype):
+        return "integer"
+    if pd.api.types.is_float_dtype(dtype):
+        return "float"
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return "datetime"
+    if isinstance(dtype, CategoricalDtype):
+        return "categorical"
     if series.map(lambda x: isinstance(x, str) or pd.isna(x)).all():
         return "text"
     return "string"
 
-def _call_openai(prompt: str,
-                 *,
-                 model: str = "gpt-4o-mini",
-                 max_tokens: int = 800) -> str:
+
+def _call_openai(prompt: str, *, model: str = "gpt-4o-mini", max_tokens: int = 800) -> str:
     """Encapsula la llamada; falla si openai no está instalado o no hay key."""
     if (openai is None) or (not os.getenv("OPENAI_API_KEY")):
         raise RuntimeError("OpenAI API no disponible.")
     openai.api_key = os.getenv("OPENAI_API_KEY")
     rsp = openai.ChatCompletion.create(
         model=model,
-        messages=[{"role": "system", "content": "You are a helpful data assistant."},
-                  {"role": "user",   "content": prompt}],
+        messages=[
+            {"role": "system", "content": "You are a helpful data assistant."},
+            {"role": "user", "content": prompt},
+        ],
         temperature=0.1,
         max_tokens=max_tokens,
     )
@@ -77,12 +120,14 @@ def _call_openai(prompt: str,
 
 
 # ╔════════════════════════════════════════════╗
-# ║ --------- PROCESADO DE BLOQUES ----------- ║
+# ║ ----------- PROCESADO DE BLOQUES --------- ║
 # ╚════════════════════════════════════════════╝
-def _process_meta_block(meta: Dict[str, Any],
-                        series: pd.Series,
-                        hll_p: int,
-                        verbose: bool) -> Dict[str, Any]:
+def _process_meta_block(
+    meta: Dict[str, Any],
+    series: pd.Series,
+    hll_p: int,
+    verbose: bool,
+) -> Dict[str, Any]:
     """
     Enriquecer un bloque de metadatos con:
       • statistics  → n_total, n_non_null, n_distinct, missing_ratio
@@ -95,25 +140,25 @@ def _process_meta_block(meta: Dict[str, Any],
 
     # ---------- estadísticas básicas ----------
     stats = {
-        "n_total":       int(series.size),
-        "n_non_null":    int(series.notna().sum()),
-        "n_distinct":    int(series.nunique(dropna=True)),
+        "n_total": int(series.size),
+        "n_non_null": int(series.notna().sum()),
+        "n_distinct": int(series.nunique(dropna=True)),
         "missing_ratio": float(series.isna().mean()),
     }
 
     # ---------- métricas numéricas ----------
     if inferred in {"integer", "float"}:
-        desc = series.describe(percentiles=[.25, .50, .75, .95])
+        desc = series.describe(percentiles=[0.25, 0.50, 0.75, 0.95])
         stats["numeric_summary"] = {
             "count": int(desc["count"]),
-            "mean":  float(desc["mean"]),
-            "std":   float(desc["std"]),
-            "min":   float(desc["min"]),
-            "p25":   float(desc["25%"]),
-            "p50":   float(desc["50%"]),
-            "p75":   float(desc["75%"]),
-            "p95":   float(desc["95%"]),
-            "max":   float(desc["max"]),
+            "mean": float(desc["mean"]),
+            "std": float(desc["std"]),
+            "min": float(desc["min"]),
+            "p25": float(desc["25%"]),
+            "p50": float(desc["50%"]),
+            "p75": float(desc["75%"]),
+            "p95": float(desc["95%"]),
+            "max": float(desc["max"]),
         }
         dom = meta.setdefault("domain", {}).setdefault("numeric", {})
         dom.setdefault("min", float(desc["min"]))
@@ -124,13 +169,13 @@ def _process_meta_block(meta: Dict[str, Any],
         lengths = series.dropna().astype(str).str.len()
         stats["text_summary"] = {
             "avg_length": float(lengths.mean()),
-            "max_length": int(lengths.max())
+            "max_length": int(lengths.max()),
         }
 
     # ---------- sketches ----------
     meta["statistics"] = stats
     meta["sketch"] = {
-        "tdigest_b64":     _tdigest_b64(series),
+        "tdigest_b64": _tdigest_b64(series),
         "hll_cardinality": _hll(series, p=hll_p),
     }
     return meta
@@ -164,16 +209,18 @@ def _var_name(block: Dict[str, Any]) -> str:
 
 
 # ---------- utils de coincidencia ----------
-import unicodedata
-def _strip_accents(s: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFD', s)
-                   if unicodedata.category(c) != 'Mn')
+_UNIT_SUFFIX_RE = re.compile(r"_[a-z]{1,3}$")  # ej. _cm, _usd, _pct
 
-_UNIT_SUFFIX_RE = re.compile(r'_[a-z]{1,3}$')   # ej. _cm, _usd, _pct
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+
 def _normalize(s: str) -> str:
     s = _strip_accents(s.lower())
-    s = _UNIT_SUFFIX_RE.sub('', s)
-    return re.sub(r'[^a-z0-9]', '', s)
+    s = _UNIT_SUFFIX_RE.sub("", s)
+    return re.sub(r"[^a-z0-9]", "", s)
+
 
 def _match_df_column(meta_name: str, df_cols: Sequence[str]) -> Optional[str]:
     """Devuelve el nombre real de la columna del DataFrame que mejor coincide con meta_name."""
@@ -202,8 +249,7 @@ def _flatten(d: Dict[str, Any], *, parent: str = "", sep: str = ".") -> Dict[str
     return out
 
 
-def _to_frame(meta_dict: Dict[str, Dict[str, Any]],
-              *, flat: bool = True, sep: str = ".") -> pd.DataFrame:
+def _to_frame(meta_dict: Dict[str, Dict[str, Any]], *, flat: bool = True, sep: str = ".") -> pd.DataFrame:
     recs = []
     for col, block in meta_dict.items():
         rec = _flatten(block, sep=sep) if flat else block.copy()
@@ -216,25 +262,27 @@ class Metadata:
     """Objeto principal para gestionar y validar metadatos."""
 
     def __init__(self) -> None:
-        self._meta:     Dict[str, Dict[str, Any]] = {}
-        self._df_cache: Optional[pd.DataFrame]    = None
-        self._history:  Dict[str, Dict[str, Any]] = {}
+        self._meta: Dict[str, Dict[str, Any]] = {}
+        self._df_cache: Optional[pd.DataFrame] = None
+        self._history: Dict[str, Dict[str, Any]] = {}
 
-    def _ensure_loaded(self) -> None:
-        if not self._meta:
-            raise RuntimeError("metadata.update() no se ha ejecutado aún.")
-
-    def update(self,
-               df: pd.DataFrame,
-               meta_source: Union[str, pathlib.Path, Sequence[Union[str, pathlib.Path]]],
-               *,
-               inplace: bool = False,
-               output: Optional[Union[str, pathlib.Path]] = None,
-               overwrite: bool = True,
-               hll_p: int = 14,
-               verbose: bool = True) -> None:
+    # ------------------------------------------------------------------
+    #                           UPDATE
+    # ------------------------------------------------------------------
+    def update(
+        self,
+        df: pd.DataFrame,
+        meta_source: Union[str, pathlib.Path, Sequence[Union[str, pathlib.Path]]],
+        *,
+        inplace: bool = False,
+        output: Optional[Union[str, pathlib.Path]] = None,
+        overwrite: bool = True,
+        hll_p: int = 14,
+        verbose: bool = True,
+    ) -> None:
         """
-        Enriquecer YAML(s) con statistics/sketch y poblar self._meta
+        Enriquecer YAML(s) con statistics/sketch y poblar self._meta.
+        Acepta rutas locales o URLs http(s).
         """
         aggregated: Dict[str, Dict[str, Any]] = {}
 
@@ -244,7 +292,7 @@ class Metadata:
                 new_schema = []
                 for block in meta["schema"]:
                     col_yaml = _var_name(block)
-                    col_df   = _match_df_column(col_yaml, df.columns)
+                    col_df = _match_df_column(col_yaml, df.columns)
                     if col_df:
                         block = _process_meta_block(block, df[col_df], hll_p, verbose)
                     else:
@@ -257,7 +305,7 @@ class Metadata:
 
             # esquema para bloque individual
             col_yaml = _var_name(meta)
-            col_df   = _match_df_column(col_yaml, df.columns)
+            col_df = _match_df_column(col_yaml, df.columns)
             if col_df:
                 meta = _process_meta_block(meta, df[col_df], hll_p, verbose)
             else:
@@ -270,12 +318,14 @@ class Metadata:
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.exists() and not overwrite:
                 raise FileExistsError(dest)
-            dest.write_text(yaml.safe_dump(meta, sort_keys=False,
-                                           allow_unicode=True), encoding="utf-8")
+            dest.write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
         # -------- procesamiento principal --------
         if isinstance(meta_source, (str, pathlib.Path)) and str(meta_source).lower().endswith(".zip"):
+            # ---------------- ZIP (solo local) ----------------
             src_zip = pathlib.Path(meta_source)
+            if _is_url(src_zip):
+                raise RuntimeError("El soporte para ZIP remotos no está habilitado.")
             if not src_zip.exists():
                 raise FileNotFoundError(src_zip)
 
@@ -287,11 +337,9 @@ class Metadata:
                         continue
                     meta = yaml.safe_load(zin.read(fname).decode())
                     meta = _handle_meta(meta)
-                    updated[fname] = yaml.safe_dump(meta, sort_keys=False,
-                                                    allow_unicode=True).encode()
+                    updated[fname] = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).encode()
 
-            dst_zip = src_zip if inplace else pathlib.Path(output or
-                       src_zip.with_name(src_zip.stem + "_updated.zip"))
+            dst_zip = src_zip if inplace else pathlib.Path(output or src_zip.with_name(src_zip.stem + "_updated.zip"))
             if dst_zip.exists() and not overwrite:
                 raise FileExistsError(dst_zip)
             with zipfile.ZipFile(dst_zip, "w") as zout:
@@ -302,20 +350,34 @@ class Metadata:
 
         else:
             files = [meta_source] if isinstance(meta_source, (str, pathlib.Path)) else meta_source
-            for path in files:
-                path = pathlib.Path(path)
-                meta = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for src in files:
+                meta = _read_yaml(src)
                 meta = _handle_meta(meta)
-                dest = path if inplace else pathlib.Path(output or path)
+
+                if _is_url(src):  # ---------- Fuente remota (solo lectura) ----------
+                    if inplace:
+                        raise RuntimeError("No se puede sobrescribir un recurso HTTP; usa inplace=False.")
+                    fname = pathlib.Path(urllib.parse.urlparse(str(src)).path).name or "schema.yaml"
+                    dest = pathlib.Path(output or tempfile.gettempdir()) / fname
+                else:  # ---------- Fuente local ----------
+                    path = pathlib.Path(src)
+                    dest = path if inplace else pathlib.Path(output or path)
+
                 _save_meta(meta, dest)
                 if verbose:
                     print(f"✔ {dest} actualizado")
 
         # -------- snapshot interno + df cache --------
-        self._meta      = aggregated
-        self._df_cache  = _to_frame(aggregated)
-        # acceso de conveniencia (p.ej. metadata.df)
+        self._meta = aggregated
+        self._df_cache = _to_frame(aggregated)
         setattr(self, "_df_cache", self._df_cache)
+
+    # ------------------------------------------------------------------
+    #                  MÉTODOS AUXILIARES DE VISUALIZACIÓN
+    # ------------------------------------------------------------------
+    def _ensure_loaded(self) -> None:
+        if not self._meta:
+            raise RuntimeError("metadata.update() no se ha ejecutado aún.")
 
     @property
     def df(self) -> Optional[pd.DataFrame]:
@@ -328,8 +390,8 @@ class Metadata:
         self._ensure_loaded()
         print("root")
         for col, block in self._meta.items():
-            dtype     = block["type"]["logical_type"]
-            nullable  = block.get("domain", {}).get("allowed_nulls_pct", 0) > 0
+            dtype = block["type"]["logical_type"]
+            nullable = block.get("domain", {}).get("allowed_nulls_pct", 0) > 0
             print(f" |-- {col}: {dtype} (nullable = {str(nullable).lower()})")
 
     def info(self) -> None:
@@ -341,52 +403,48 @@ class Metadata:
         dtype_counts: Dict[str, int] = {}
         for i, (col, block) in enumerate(self._meta.items()):
             stats = block.get("statistics", {})
-            nn    = stats.get("n_non_null", "‑‑")
+            nn = stats.get("n_non_null", "‑‑")
             dtype = block["type"]["logical_type"]
             print(f"{i:>2}   {col:<18} {nn:>14}   {dtype}")
             dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
         print("dtypes:", ", ".join(f"{k}({v})" for k, v in dtype_counts.items()))
 
-
-# ---------- dentro de Metadata.validate() ----------
-    def validate(self,
-                df: pd.DataFrame,
-                *,
-                detail: int = 0,
-                capitalize: bool = False,          # ← NUEVO
-                message: bool = True) -> bool:
+    # ------------------------------------------------------------------
+    #                            VALIDATE
+    # ------------------------------------------------------------------
+    def validate(
+        self,
+        df: pd.DataFrame,
+        *,
+        detail: int = 0,
+        capitalize: bool = False,
+        message: bool = True,
+    ) -> bool:
 
         self._ensure_loaded()
-        passed     = True
-        yaml_cols  = set(self._meta.keys())
-        df_cols    = set(df.columns)
+        passed = True
+        yaml_cols = set(self._meta.keys())
+        df_cols = set(df.columns)
 
         # --- autocorrección opcional de capitalización ---
         if capitalize:
-            # pares (yaml → df) que difieren solo por mayúsculas
-            fixes = {y: d for y in yaml_cols
-                              for d in df_cols
-                              if y.lower() == d.lower() and y != d}
+            fixes = {y: d for y in yaml_cols for d in df_cols if y.lower() == d.lower() and y != d}
             for y, d in fixes.items():
-                self._meta[d] = self._meta.pop(y)          # renombra clave
-                # actualiza variable_id si existe
+                self._meta[d] = self._meta.pop(y)
                 blk = self._meta[d]
                 try:
                     blk["identity"]["variable_id"] = d
                 except Exception:
                     pass
-                # renombra índice en el cache plano
                 if self._df_cache is not None and y in self._df_cache.index:
                     self._df_cache.rename(index={y: d}, inplace=True)
             if fixes and message:
                 print(f"[FIXED] Columnas actualizadas en YAML: {list(fixes.items())}")
-
-            # recomputar sets tras la corrección
             yaml_cols = set(self._meta.keys())
 
         # ---------- checks originales ----------
         missing = yaml_cols - df_cols
-        extra   = df_cols  - yaml_cols
+        extra = df_cols - yaml_cols
         if missing or extra:
             passed = False
             if message:
@@ -398,7 +456,7 @@ class Metadata:
         common = yaml_cols & df_cols
         for col in common:
             series = df[col]
-            block  = self._meta[col]
+            block = self._meta[col]
 
             logic_real = _infer_logic(series)
             logic_yaml = block["type"]["logical_type"]
@@ -421,8 +479,9 @@ class Metadata:
                         if message:
                             print(f"[RANGE] {col}: max {series.max()} > {hi}")
                 if "categorical" in dom and dom["categorical"].get("closed"):
-                    allowed = set(dom["categorical"].get("codes", [])) | \
-                              set(dom["categorical"].get("labels", {}).values())
+                    allowed = set(dom["categorical"].get("codes", [])) | set(
+                        dom["categorical"].get("labels", {}).values()
+                    )
                     invalid = series.dropna().loc[~series.dropna().isin(allowed)]
                     if not invalid.empty:
                         passed = False
@@ -431,7 +490,8 @@ class Metadata:
                             print(f"[DOMAIN] {col}: {len(invalid)} invalid → {sample}")
                 if pattern := dom.get("pattern"):
                     bad = series.dropna().astype(str).loc[
-                        ~series.dropna().astype(str).str.match(pattern)]
+                        ~series.dropna().astype(str).str.match(pattern)
+                    ]
                     if not bad.empty:
                         passed = False
                         if message:
@@ -453,34 +513,36 @@ class Metadata:
                             print(f"[UNIQUE] {col}: {dups} duplicados")
         return passed
 
-
-
-
-    def compare(self,
-                meta_a: Union[str, pathlib.Path],
-                meta_b: Union[str, pathlib.Path],
-                *,
-                detail: int = 1,
-                drift_threshold: float = .1,
-                message: bool = True) -> bool:
+    # ------------------------------------------------------------------
+    #                           COMPARE
+    # ------------------------------------------------------------------
+    def compare(
+        self,
+        meta_a: Union[str, pathlib.Path],
+        meta_b: Union[str, pathlib.Path],
+        *,
+        detail: int = 1,
+        drift_threshold: float = 0.1,
+        message: bool = True,
+    ) -> bool:
         """Comparación de dos esquemas (o snapshot vs archivo)."""
 
         def _load_meta(source: Union[str, pathlib.Path]) -> Dict[str, Dict[str, Any]]:
             if isinstance(source, (str, pathlib.Path)) and str(source).lower().endswith(".yaml"):
-                m       = yaml.safe_load(pathlib.Path(source).read_text(encoding="utf-8"))
-                blocks  = _gather_blocks(m)
+                m = _read_yaml(source)
+                blocks = _gather_blocks(m)
                 return {_var_name(b): b for b in blocks}
             if source in self._history:
                 return self._history[source]
             raise ValueError(f"No meta source found for {source}")
 
-        a       = _load_meta(meta_a)
-        b       = _load_meta(meta_b)
-        passed  = True
+        a = _load_meta(meta_a)
+        b = _load_meta(meta_b)
+        passed = True
 
         if set(a) != set(b):
             missing = set(a).symmetric_difference(b)
-            passed  = False
+            passed = False
             if message:
                 print(f"[COLUMNS] sets differ: {missing}")
 
@@ -488,13 +550,14 @@ class Metadata:
             if a[col]["type"]["logical_type"] != b[col]["type"]["logical_type"]:
                 passed = False
                 if message:
-                    print(f"[TYPE] {col}: {a[col]['type']['logical_type']} → "
-                          f"{b[col]['type']['logical_type']}")
+                    print(f"[TYPE] {col}: {a[col]['type']['logical_type']} → {b[col]['type']['logical_type']}")
             if a[col]["type"].get("measurement_scale") != b[col]["type"].get("measurement_scale"):
                 passed = False
                 if message:
-                    print(f"[SCALE] {col}: {a[col]['type'].get('measurement_scale')} → "
-                          f"{b[col]['type'].get('measurement_scale')}")
+                    print(
+                        f"[SCALE] {col}: {a[col]['type'].get('measurement_scale')} → "
+                        f"{b[col]['type'].get('measurement_scale')}"
+                    )
 
         if detail >= 1:
             for col in set(a) & set(b):
@@ -515,6 +578,14 @@ class Metadata:
                                 print(f"[DRIFT] {col}.{p} Δ={diff:.2%}")
         return passed
 
+    # ------------------------------------------------------------------
+    #                    OTROS MÉTODOS (export, describe, ...)
+    # ------------------------------------------------------------------
+    # ... (los métodos export_schema, generate_expectations, quality_report,
+    #      transform, snapshot, load_snapshot, list_snapshots, research,
+    #      describe, show, filter permanecen idénticos al original y se
+    #      omiten aquí por brevedad. Copia/pega tus versiones si tenías
+    #      cambios locales).
     def export_schema(self,
                       target: str,
                       *,
