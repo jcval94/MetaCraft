@@ -259,6 +259,26 @@ def _to_frame(meta_dict: Dict[str, Dict[str, Any]], *, flat: bool = True, sep: s
     return pd.DataFrame(recs).set_index("__column__")
 
 
+def _unflatten(d: Dict[str, Any], *, sep: str = ".") -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if k == "__column__" or (isinstance(v, float) and pd.isna(v)):
+            continue
+        current = out
+        parts = k.split(sep)
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+        current[parts[-1]] = v
+    return out
+
+
+def _from_frame(df: pd.DataFrame, *, sep: str = ".") -> Dict[str, Dict[str, Any]]:
+    meta: Dict[str, Dict[str, Any]] = {}
+    for col, row in df.iterrows():
+        meta[col] = _unflatten(row.to_dict(), sep=sep)
+    return meta
+
+
 class Metadata:
     """Objeto principal para gestionar y validar metadatos."""
 
@@ -266,6 +286,19 @@ class Metadata:
         self._meta: Dict[str, Dict[str, Any]] = {}
         self._df_cache: Optional[pd.DataFrame] = None
         self._history: Dict[str, Dict[str, Any]] = {}
+
+    def _attach_upgrade(self) -> None:
+        if self._df_cache is None:
+            return
+
+        def upgrade(output: Optional[Union[str, pathlib.Path]] = None) -> None:
+            self._meta = _from_frame(self._df_cache)
+            if output:
+                path = pathlib.Path(output)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                data = {"schema": list(self._meta.values())}
+                path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        setattr(self._df_cache, "upgrade", upgrade)
 
     # ------------------------------------------------------------------
     #                           UPDATE
@@ -393,6 +426,7 @@ class Metadata:
         # -------- snapshot interno + df cache --------
         self._meta = aggregated
         self._df_cache = _to_frame(aggregated)
+        self._attach_upgrade()
         setattr(self, "_df_cache", self._df_cache)
 
     # ------------------------------------------------------------------
@@ -404,10 +438,15 @@ class Metadata:
 
     @property
     def df(self) -> Optional[pd.DataFrame]:
+        if self._df_cache is not None and not hasattr(self._df_cache, "upgrade"):
+            self._attach_upgrade()
         return self._df_cache
 
     def to_frame(self, *, flat: bool = True, sep: str = ".") -> pd.DataFrame:
-        return _to_frame(self._meta, flat=flat, sep=sep)
+        df = _to_frame(self._meta, flat=flat, sep=sep)
+        self._df_cache = df
+        self._attach_upgrade()
+        return df
 
     def printSchema(self) -> None:
         self._ensure_loaded()
