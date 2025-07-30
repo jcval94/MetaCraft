@@ -54,6 +54,7 @@ with open('schema.yaml', 'w') as f:
 
 m = Metadata()
 m.update(df, 'schema.yaml', inplace=True)
+m.quality_report(df)
 ```
 
 ### Resultados
@@ -71,6 +72,7 @@ Columns: 2 entries
  1   age                             4   integer
 dtypes: integer(2)
 Validation passed: True
+Quality score: 100.0 (A)
 ```
 
 ## Roadmap
