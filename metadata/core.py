@@ -813,3 +813,6 @@ class Metadata:
                 "tags":         ", ".join(block["identity"].get("tags", []))
             })
         return pd.DataFrame(rows)
+
+
+__all__ = ["Metadata"]
