@@ -298,7 +298,12 @@ class Metadata:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 data = {"schema": list(self._meta.values())}
                 path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        def revert() -> None:
+            self._df_cache = _to_frame(self._meta)
+            self._attach_upgrade()
+
         setattr(self._df_cache, "upgrade", upgrade)
+        setattr(self._df_cache, "revert", revert)
 
     # ------------------------------------------------------------------
     #                           UPDATE

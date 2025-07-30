@@ -100,6 +100,7 @@ m.df.loc['age', 'identity.description_i18n.es'] = 'Edad del pasajero'
 m.df.loc['age', ['domain.numeric.min', 'domain.numeric.max']] = [0, 120]
 
 m.df.upgrade('schema.yaml')  # guarda el YAML actualizado
+m.df.revert()                # descarta cambios locales
 ```
 
 ## Roadmap
