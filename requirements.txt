@@ -1,7 +1,6 @@
-pandas>=2.1
 numpy>=1.23
+pandas>=2.1
 PyYAML>=6.0
-# ---- opcionales (comenta si no los usas) ----
-tdigest>=0.6
-datasketch>=1.5
 openai>=1.14
+tdigest==0.5.2.2
+datasketch>=1.5
