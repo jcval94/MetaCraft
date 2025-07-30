@@ -1,0 +1,744 @@
+# metadata.py — versión 2025‑07‑28 (refactor a clase Metadata)
+# ===========================================================
+#  ✦ Módulo unificado de metadatos con:
+#    • update · printSchema · info · describe (con validate previo)
+#    • validate · compare · export_schema · generate_expectations
+#    • quality_report · transform · snapshot / load_snapshot / list_snapshots
+#    • research (IA)
+# -----------------------------------------------------------
+import base64, json, os, pathlib, re, tempfile, warnings, zipfile
+from difflib import get_close_matches
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from pandas.api.types import CategoricalDtype
+
+import numpy as np
+import pandas as pd
+import yaml
+
+# ---------- dependencias opcionales ----------
+try:
+    import openai
+except ImportError:                              # se inicializa solo si hay key
+    openai = None
+
+try:
+    from tdigest import TDigest
+except ImportError:
+    TDigest = None
+
+try:
+    from datasketch import HyperLogLog
+except ImportError:
+    HyperLogLog = None
+# ---------------------------------------------
+def _tdigest_b64(series: pd.Series) -> Optional[str]:
+    if TDigest is None or not pd.api.types.is_numeric_dtype(series):
+        return None
+    t = TDigest()
+    t.batch_update(series.dropna().astype(float))
+    return base64.b64encode(json.dumps(t.to_dict()).encode()).decode()
+
+def _hll(series: pd.Series, p: int = 14) -> Optional[int]:
+    if HyperLogLog is None:
+        return None
+    hll = HyperLogLog(p=p)
+    for x in series.dropna():
+        hll.update(str(x).encode())
+    return int(hll.count())
+
+def _infer_logic(series: pd.Series) -> str:
+    dtype = series.dtype          # evitamos llamar varias veces
+
+    if pd.api.types.is_bool_dtype(dtype):          return "boolean"
+    if pd.api.types.is_integer_dtype(dtype):       return "integer"
+    if pd.api.types.is_float_dtype(dtype):         return "float"
+    if pd.api.types.is_datetime64_any_dtype(dtype):return "datetime"
+    if isinstance(dtype, CategoricalDtype):        return "categorical"
+    if series.map(lambda x: isinstance(x, str) or pd.isna(x)).all():
+        return "text"
+    return "string"
+
+def _call_openai(prompt: str,
+                 *,
+                 model: str = "gpt-4o-mini",
+                 max_tokens: int = 800) -> str:
+    """Encapsula la llamada; falla si openai no está instalado o no hay key."""
+    if (openai is None) or (not os.getenv("OPENAI_API_KEY")):
+        raise RuntimeError("OpenAI API no disponible.")
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    rsp = openai.ChatCompletion.create(
+        model=model,
+        messages=[{"role": "system", "content": "You are a helpful data assistant."},
+                  {"role": "user",   "content": prompt}],
+        temperature=0.1,
+        max_tokens=max_tokens,
+    )
+    return rsp.choices[0].message.content.strip()
+
+
+# ╔════════════════════════════════════════════╗
+# ║ --------- PROCESADO DE BLOQUES ----------- ║
+# ╚════════════════════════════════════════════╝
+def _process_meta_block(meta: Dict[str, Any],
+                        series: pd.Series,
+                        hll_p: int,
+                        verbose: bool) -> Dict[str, Any]:
+    """
+    Enriquecer un bloque de metadatos con:
+      • statistics  → n_total, n_non_null, n_distinct, missing_ratio
+      • numeric_summary o text_summary según el tipo
+      • sketch      → tdigest_b64 + hll_cardinality
+      • domain.numeric.min/max si faltan
+    """
+    inferred = _infer_logic(series)
+    meta.setdefault("type", {})["logical_type"] = inferred
+
+    # ---------- estadísticas básicas ----------
+    stats = {
+        "n_total":       int(series.size),
+        "n_non_null":    int(series.notna().sum()),
+        "n_distinct":    int(series.nunique(dropna=True)),
+        "missing_ratio": float(series.isna().mean()),
+    }
+
+    # ---------- métricas numéricas ----------
+    if inferred in {"integer", "float"}:
+        desc = series.describe(percentiles=[.25, .50, .75, .95])
+        stats["numeric_summary"] = {
+            "count": int(desc["count"]),
+            "mean":  float(desc["mean"]),
+            "std":   float(desc["std"]),
+            "min":   float(desc["min"]),
+            "p25":   float(desc["25%"]),
+            "p50":   float(desc["50%"]),
+            "p75":   float(desc["75%"]),
+            "p95":   float(desc["95%"]),
+            "max":   float(desc["max"]),
+        }
+        dom = meta.setdefault("domain", {}).setdefault("numeric", {})
+        dom.setdefault("min", float(desc["min"]))
+        dom.setdefault("max", float(desc["max"]))
+
+    # ---------- métricas de texto ----------
+    elif inferred in {"text", "string"}:
+        lengths = series.dropna().astype(str).str.len()
+        stats["text_summary"] = {
+            "avg_length": float(lengths.mean()),
+            "max_length": int(lengths.max())
+        }
+
+    # ---------- sketches ----------
+    meta["statistics"] = stats
+    meta["sketch"] = {
+        "tdigest_b64":     _tdigest_b64(series),
+        "hll_cardinality": _hll(series, p=hll_p),
+    }
+    return meta
+
+
+def _gather_blocks(unified_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Aplana schema → lista de bloques variable"""
+    if "schema" in unified_meta:
+        return unified_meta["schema"]
+    return [unified_meta]
+
+
+def _var_name(block: Dict[str, Any]) -> str:
+    """Obtiene el nombre de la variable desde varios posibles campos."""
+    try:
+        return block["identity"]["variable_id"].split(":")[-1]
+    except Exception:
+        pass
+    try:
+        name = block.get("identity", {}).get("name")
+        if isinstance(name, str) and name:
+            return name
+    except Exception:
+        pass
+    if isinstance(block.get("name"), str) and block.get("name"):
+        return block["name"]
+    lbl = block.get("identity", {}).get("label_i18n", {})
+    if isinstance(lbl, dict) and lbl:
+        return next(iter(lbl.values()))
+    return "<unknown>"
+
+
+# ---------- utils de coincidencia ----------
+import unicodedata
+def _strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s)
+                   if unicodedata.category(c) != 'Mn')
+
+_UNIT_SUFFIX_RE = re.compile(r'_[a-z]{1,3}$')   # ej. _cm, _usd, _pct
+def _normalize(s: str) -> str:
+    s = _strip_accents(s.lower())
+    s = _UNIT_SUFFIX_RE.sub('', s)
+    return re.sub(r'[^a-z0-9]', '', s)
+
+def _match_df_column(meta_name: str, df_cols: Sequence[str]) -> Optional[str]:
+    """Devuelve el nombre real de la columna del DataFrame que mejor coincide con meta_name."""
+    if meta_name in df_cols:
+        return meta_name
+    low_map = {c.lower(): c for c in df_cols}
+    if meta_name.lower() in low_map:
+        return low_map[meta_name.lower()]
+    norm_map = {_normalize(c): c for c in df_cols}
+    norm_name = _normalize(meta_name)
+    if norm_name in norm_map:
+        return norm_map[norm_name]
+    cand = get_close_matches(norm_name, norm_map.keys(), n=1, cutoff=0.9)
+    return norm_map[cand[0]] if cand else None
+
+
+# ---------- YAML→DataFrame helpers ----------
+def _flatten(d: Dict[str, Any], *, parent: str = "", sep: str = ".") -> Dict[str, Any]:
+    out = {}
+    for k, v in d.items():
+        key = f"{parent}{sep}{k}" if parent else k
+        if isinstance(v, dict):
+            out.update(_flatten(v, parent=key, sep=sep))
+        else:
+            out[key] = v
+    return out
+
+
+def _to_frame(meta_dict: Dict[str, Dict[str, Any]],
+              *, flat: bool = True, sep: str = ".") -> pd.DataFrame:
+    recs = []
+    for col, block in meta_dict.items():
+        rec = _flatten(block, sep=sep) if flat else block.copy()
+        rec["__column__"] = col
+        recs.append(rec)
+    return pd.DataFrame(recs).set_index("__column__")
+
+
+class Metadata:
+    """Objeto principal para gestionar y validar metadatos."""
+
+    def __init__(self) -> None:
+        self._meta:     Dict[str, Dict[str, Any]] = {}
+        self._df_cache: Optional[pd.DataFrame]    = None
+        self._history:  Dict[str, Dict[str, Any]] = {}
+
+    def _ensure_loaded(self) -> None:
+        if not self._meta:
+            raise RuntimeError("metadata.update() no se ha ejecutado aún.")
+
+    def update(self,
+               df: pd.DataFrame,
+               meta_source: Union[str, pathlib.Path, Sequence[Union[str, pathlib.Path]]],
+               *,
+               inplace: bool = False,
+               output: Optional[Union[str, pathlib.Path]] = None,
+               overwrite: bool = True,
+               hll_p: int = 14,
+               verbose: bool = True) -> None:
+        """
+        Enriquecer YAML(s) con statistics/sketch y poblar self._meta
+        """
+        aggregated: Dict[str, Dict[str, Any]] = {}
+
+        # -------- funciones internas (clausura) --------
+        def _handle_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+            if "schema" in meta:
+                new_schema = []
+                for block in meta["schema"]:
+                    col_yaml = _var_name(block)
+                    col_df   = _match_df_column(col_yaml, df.columns)
+                    if col_df:
+                        block = _process_meta_block(block, df[col_df], hll_p, verbose)
+                    else:
+                        if verbose:
+                            warnings.warn(f"[update] '{col_yaml}' no tiene columna equivalente en el DataFrame.")
+                    new_schema.append(block)
+                    aggregated[col_yaml] = block
+                meta["schema"] = new_schema
+                return meta
+
+            # esquema para bloque individual
+            col_yaml = _var_name(meta)
+            col_df   = _match_df_column(col_yaml, df.columns)
+            if col_df:
+                meta = _process_meta_block(meta, df[col_df], hll_p, verbose)
+            else:
+                if verbose:
+                    warnings.warn(f"[update] Columna '{col_yaml}' no encontrada en el DataFrame.")
+            aggregated[col_yaml] = meta
+            return meta
+
+        def _save_meta(meta: Dict[str, Any], dest: pathlib.Path):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists() and not overwrite:
+                raise FileExistsError(dest)
+            dest.write_text(yaml.safe_dump(meta, sort_keys=False,
+                                           allow_unicode=True), encoding="utf-8")
+
+        # -------- procesamiento principal --------
+        if isinstance(meta_source, (str, pathlib.Path)) and str(meta_source).lower().endswith(".zip"):
+            src_zip = pathlib.Path(meta_source)
+            if not src_zip.exists():
+                raise FileNotFoundError(src_zip)
+
+            updated: Dict[str, bytes] = {}
+            with zipfile.ZipFile(src_zip, "r") as zin:
+                for fname in zin.namelist():
+                    if not fname.lower().endswith((".yml", ".yaml")):
+                        updated[fname] = zin.read(fname)
+                        continue
+                    meta = yaml.safe_load(zin.read(fname).decode())
+                    meta = _handle_meta(meta)
+                    updated[fname] = yaml.safe_dump(meta, sort_keys=False,
+                                                    allow_unicode=True).encode()
+
+            dst_zip = src_zip if inplace else pathlib.Path(output or
+                       src_zip.with_name(src_zip.stem + "_updated.zip"))
+            if dst_zip.exists() and not overwrite:
+                raise FileExistsError(dst_zip)
+            with zipfile.ZipFile(dst_zip, "w") as zout:
+                for fname, data in updated.items():
+                    zout.writestr(fname, data)
+            if verbose:
+                print(f"✔ ZIP escrito en {dst_zip}")
+
+        else:
+            files = [meta_source] if isinstance(meta_source, (str, pathlib.Path)) else meta_source
+            for path in files:
+                path = pathlib.Path(path)
+                meta = yaml.safe_load(path.read_text(encoding="utf-8"))
+                meta = _handle_meta(meta)
+                dest = path if inplace else pathlib.Path(output or path)
+                _save_meta(meta, dest)
+                if verbose:
+                    print(f"✔ {dest} actualizado")
+
+        # -------- snapshot interno + df cache --------
+        self._meta      = aggregated
+        self._df_cache  = _to_frame(aggregated)
+        # acceso de conveniencia (p.ej. metadata.df)
+        setattr(self, "_df_cache", self._df_cache)
+
+    @property
+    def df(self) -> Optional[pd.DataFrame]:
+        return self._df_cache
+
+    def to_frame(self, *, flat: bool = True, sep: str = ".") -> pd.DataFrame:
+        return _to_frame(self._meta, flat=flat, sep=sep)
+
+    def printSchema(self) -> None:
+        self._ensure_loaded()
+        print("root")
+        for col, block in self._meta.items():
+            dtype     = block["type"]["logical_type"]
+            nullable  = block.get("domain", {}).get("allowed_nulls_pct", 0) > 0
+            print(f" |-- {col}: {dtype} (nullable = {str(nullable).lower()})")
+
+    def info(self) -> None:
+        self._ensure_loaded()
+        print("<class 'metadata.dataset'>")
+        print(f"Columns: {len(self._meta)} entries")
+        print(" #   Column            Non-Null Count   Dtype")
+        print("---  ------            --------------   -----")
+        dtype_counts: Dict[str, int] = {}
+        for i, (col, block) in enumerate(self._meta.items()):
+            stats = block.get("statistics", {})
+            nn    = stats.get("n_non_null", "‑‑")
+            dtype = block["type"]["logical_type"]
+            print(f"{i:>2}   {col:<18} {nn:>14}   {dtype}")
+            dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+        print("dtypes:", ", ".join(f"{k}({v})" for k, v in dtype_counts.items()))
+
+
+# ---------- dentro de Metadata.validate() ----------
+    def validate(self,
+                df: pd.DataFrame,
+                *,
+                detail: int = 0,
+                capitalize: bool = False,          # ← NUEVO
+                message: bool = True) -> bool:
+
+        self._ensure_loaded()
+        passed     = True
+        yaml_cols  = set(self._meta.keys())
+        df_cols    = set(df.columns)
+
+        # --- autocorrección opcional de capitalización ---
+        if capitalize:
+            # pares (yaml → df) que difieren solo por mayúsculas
+            fixes = {y: d for y in yaml_cols
+                              for d in df_cols
+                              if y.lower() == d.lower() and y != d}
+            for y, d in fixes.items():
+                self._meta[d] = self._meta.pop(y)          # renombra clave
+                # actualiza variable_id si existe
+                blk = self._meta[d]
+                try:
+                    blk["identity"]["variable_id"] = d
+                except Exception:
+                    pass
+                # renombra índice en el cache plano
+                if self._df_cache is not None and y in self._df_cache.index:
+                    self._df_cache.rename(index={y: d}, inplace=True)
+            if fixes and message:
+                print(f"[FIXED] Columnas actualizadas en YAML: {list(fixes.items())}")
+
+            # recomputar sets tras la corrección
+            yaml_cols = set(self._meta.keys())
+
+        # ---------- checks originales ----------
+        missing = yaml_cols - df_cols
+        extra   = df_cols  - yaml_cols
+        if missing or extra:
+            passed = False
+            if message:
+                if missing:
+                    print(f"[MISSING] Columnas faltantes en DF: {sorted(missing)}")
+                if extra:
+                    print(f"[EXTRA]   Columnas no esperadas en DF: {sorted(extra)}")
+
+        common = yaml_cols & df_cols
+        for col in common:
+            series = df[col]
+            block  = self._meta[col]
+
+            logic_real = _infer_logic(series)
+            logic_yaml = block["type"]["logical_type"]
+            if logic_real != logic_yaml:
+                passed = False
+                if message:
+                    print(f"[TYPE] {col}: {logic_real} != {logic_yaml}")
+
+            # --- detalle 1 ---
+            if detail >= 1:
+                dom = block.get("domain", {})
+                if "numeric" in dom:
+                    lo, hi = dom["numeric"].get("min"), dom["numeric"].get("max")
+                    if lo is not None and series.min() < lo - 1e-9:
+                        passed = False
+                        if message:
+                            print(f"[RANGE] {col}: min {series.min()} < {lo}")
+                    if hi is not None and series.max() > hi + 1e-9:
+                        passed = False
+                        if message:
+                            print(f"[RANGE] {col}: max {series.max()} > {hi}")
+                if "categorical" in dom and dom["categorical"].get("closed"):
+                    allowed = set(dom["categorical"].get("codes", [])) | \
+                              set(dom["categorical"].get("labels", {}).values())
+                    invalid = series.dropna().loc[~series.dropna().isin(allowed)]
+                    if not invalid.empty:
+                        passed = False
+                        if message:
+                            sample = invalid.unique()[:5]
+                            print(f"[DOMAIN] {col}: {len(invalid)} invalid → {sample}")
+                if pattern := dom.get("pattern"):
+                    bad = series.dropna().astype(str).loc[
+                        ~series.dropna().astype(str).str.match(pattern)]
+                    if not bad.empty:
+                        passed = False
+                        if message:
+                            print(f"[PATTERN] {col}: {len(bad)} no cumplen /{pattern}/")
+
+            # --- detalle 2 ---
+            if detail >= 2:
+                allowed_null = block.get("domain", {}).get("allowed_nulls_pct", 0)
+                mr = series.isna().mean()
+                if mr > allowed_null + 1e-9:
+                    passed = False
+                    if message:
+                        print(f"[NULLS] {col}: {mr:.2%} > {allowed_null:.2%}")
+                if block.get("domain", {}).get("unique"):
+                    dups = series.duplicated().sum()
+                    if dups:
+                        passed = False
+                        if message:
+                            print(f"[UNIQUE] {col}: {dups} duplicados")
+        return passed
+
+
+
+
+    def compare(self,
+                meta_a: Union[str, pathlib.Path],
+                meta_b: Union[str, pathlib.Path],
+                *,
+                detail: int = 1,
+                drift_threshold: float = .1,
+                message: bool = True) -> bool:
+        """Comparación de dos esquemas (o snapshot vs archivo)."""
+
+        def _load_meta(source: Union[str, pathlib.Path]) -> Dict[str, Dict[str, Any]]:
+            if isinstance(source, (str, pathlib.Path)) and str(source).lower().endswith(".yaml"):
+                m       = yaml.safe_load(pathlib.Path(source).read_text(encoding="utf-8"))
+                blocks  = _gather_blocks(m)
+                return {_var_name(b): b for b in blocks}
+            if source in self._history:
+                return self._history[source]
+            raise ValueError(f"No meta source found for {source}")
+
+        a       = _load_meta(meta_a)
+        b       = _load_meta(meta_b)
+        passed  = True
+
+        if set(a) != set(b):
+            missing = set(a).symmetric_difference(b)
+            passed  = False
+            if message:
+                print(f"[COLUMNS] sets differ: {missing}")
+
+        for col in set(a) & set(b):
+            if a[col]["type"]["logical_type"] != b[col]["type"]["logical_type"]:
+                passed = False
+                if message:
+                    print(f"[TYPE] {col}: {a[col]['type']['logical_type']} → "
+                          f"{b[col]['type']['logical_type']}")
+            if a[col]["type"].get("measurement_scale") != b[col]["type"].get("measurement_scale"):
+                passed = False
+                if message:
+                    print(f"[SCALE] {col}: {a[col]['type'].get('measurement_scale')} → "
+                          f"{b[col]['type'].get('measurement_scale')}")
+
+        if detail >= 1:
+            for col in set(a) & set(b):
+                sa, sb = a[col]["statistics"], b[col]["statistics"]
+                for k in ("missing_ratio",):
+                    diff = abs(sa[k] - sb[k])
+                    if diff > drift_threshold:
+                        passed = False
+                        if message:
+                            print(f"[DRIFT] {col}.{k} Δ={diff:.2%}")
+                if "numeric_summary" in sa and "numeric_summary" in sb:
+                    for p in ("p50", "p95"):
+                        base = sa["numeric_summary"][p] or 1e-9
+                        diff = abs(sb["numeric_summary"][p] - sa["numeric_summary"][p]) / abs(base)
+                        if diff > drift_threshold:
+                            passed = False
+                            if message:
+                                print(f"[DRIFT] {col}.{p} Δ={diff:.2%}")
+        return passed
+
+    def export_schema(self,
+                      target: str,
+                      *,
+                      dialect: Optional[str] = None,
+                      style_hint: str = "",
+                      **llm_kwargs) -> Any:
+        self._ensure_loaded()
+        if target.lower() == "spark" and dialect is None:
+            from pyspark.sql.types import (StructField, StructType,
+                                           StringType, IntegerType, FloatType,
+                                           BooleanType, TimestampType)
+            map_py = {
+                "string": StringType(),
+                "text": StringType(),
+                "integer": IntegerType(),
+                "float": FloatType(),
+                "boolean": BooleanType(),
+                "datetime": TimestampType(),
+                "categorical": StringType(),
+                "array": StringType()
+            }
+            fields = [StructField(col, map_py[b["type"]["logical_type"]], True)
+                      for col, b in self._meta.items()]
+            return StructType(fields)
+
+        prompt = f"""You will receive a YAML schema. Convert it to a {target} artifact.
+        Dialect: {dialect or 'generic'}. Style guide: {style_hint}. Return ONLY the artifact."""
+        schema_yaml = yaml.safe_dump({"schema": list(self._meta.values())},
+                                     sort_keys=False, allow_unicode=True)
+        return _call_openai(prompt + "\n\n---\n" + schema_yaml,
+                            model=llm_kwargs.get("model", "gpt-4o-mini"))
+
+    def generate_expectations(self,
+                              framework: str = "great_expectations",
+                              *,
+                              descriptive: bool = True,
+                              **llm_kwargs) -> str:
+        self._ensure_loaded()
+        prompt = f"""Convert the following YAML schema into a {framework} expectation suite.
+        Include descriptions: {descriptive}. Return only the suite."""
+        schema_yaml = yaml.safe_dump({"schema": list(self._meta.values())},
+                                     sort_keys=False, allow_unicode=True)
+        return _call_openai(prompt + "\n\n---\n" + schema_yaml,
+                            model=llm_kwargs.get("model", "gpt-4o-mini"))
+
+    def quality_report(self,
+                       *,
+                       baseline: Optional[str] = None,
+                       weights: Optional[Dict[str, float]] = None,
+                       message: bool = True) -> Dict[str, Any]:
+        self._ensure_loaded()
+        weights = weights or {"completeness": .6, "drift": .4}
+        comp_pass = self.validate(pd.DataFrame({}), detail=2, message=False)
+        completeness = 1.0 if comp_pass else 0.5
+        drift_score  = 1.0
+        if baseline:
+            drift_ok    = self.compare(baseline, "current", detail=1, message=False)
+            drift_score = 1.0 if drift_ok else 0.5
+        score = 100 * (weights["completeness"] * completeness +
+                       weights["drift"] * drift_score)
+        grade = ("A" if score >= 90 else
+                 "B" if score >= 75 else
+                 "C" if score >= 60 else
+                 "D" if score >= 40 else "F")
+        if message:
+            print(f"Quality score: {score:.1f} ({grade})")
+        return {"score": score, "grade": grade}
+
+    def _coerce(self, series: pd.Series, logic: str):
+        if logic == "integer":
+            return pd.to_numeric(series, errors="coerce").astype("Int64")
+        if logic == "float":
+            return pd.to_numeric(series, errors="coerce")
+        if logic == "boolean":
+            return series.astype("boolean")
+        if logic == "datetime":
+            return pd.to_datetime(series, errors="coerce", utc=True)
+        return series
+
+    def transform(self,
+                  df: pd.DataFrame,
+                  *,
+                  coerce_types: bool = True,
+                  add_missing: bool = True,
+                  drop_extra: bool = True,
+                  fillna: Union[str, float, Dict[str, Any], None] = None) -> pd.DataFrame:
+        """Devuelve un nuevo DataFrame ajustado al esquema."""
+        self._ensure_loaded()
+        df2 = df.copy()
+        for col, block in self._meta.items():
+            if col not in df2.columns:
+                if add_missing:
+                    df2[col] = np.nan
+                else:
+                    continue
+            if coerce_types:
+                df2[col] = self._coerce(df2[col], block["type"]["logical_type"])
+            if fillna is not None:
+                value = fillna[col] if isinstance(fillna, dict) else fillna
+                df2[col] = df2[col].fillna(value)
+        if drop_extra:
+            extra = set(df2.columns) - set(self._meta.keys())
+            df2 = df2.drop(columns=list(extra))
+        return df2
+
+    def snapshot(self, label: str) -> None:
+        self._ensure_loaded()
+        self._history[label] = {k: v.copy() for k, v in self._meta.items()}
+
+    def load_snapshot(self, label: str) -> None:
+        if label not in self._history:
+            raise KeyError(label)
+        self._meta = {k: v.copy() for k, v in self._history[label].items()}
+
+    def list_snapshots(self) -> List[str]:
+        return list(self._history.keys())
+
+    def research(self,
+                 df: pd.DataFrame,
+                 *,
+                 sample_rows: int = 500,
+                 temperature: float = .2,
+                 topics: Sequence[str] = ("correlations", "clusters", "anomalies"),
+                 **llm_kwargs) -> Dict[str, Any]:
+        self._ensure_loaded()
+        if openai is None or not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("OpenAI API no disponible.")
+        samp = df.sample(n=min(sample_rows, len(df)), random_state=42)
+        csv_preview = samp.to_csv(index=False, max_cols=15, line_terminator="\n")[:40_000]
+        prompt = f"""You are a senior data scientist.
+        Topics requested: {', '.join(topics)}.
+        Analyse the following CSV sample (header in first row).
+        Return JSON with keys exactly {list(topics)}."""
+        analysis = _call_openai(prompt + "\n\n" + csv_preview,
+                                model=llm_kwargs.get("model", "gpt-4o-mini"),
+                                max_tokens=1200)
+        try:
+            return json.loads(analysis)
+        except json.JSONDecodeError:
+            return {"raw": analysis}
+
+
+    def describe(self,
+                 df: Optional[pd.DataFrame] = None,
+                 *,
+                 require_valid: bool = False,
+                 detail: int = 0,
+                 message: bool = False) -> Optional[pd.DataFrame]:
+        self._ensure_loaded()
+        if df is not None and require_valid and not self.validate(df, detail=detail, message=message):
+            if message:
+                print("❌  describe() abortado: metadata.validate() no pasó.")
+            return None
+
+        metrics  = ["count", "mean", "std", "min", "p25", "p50", "p75", "p95", "max"]
+        rows     = {m: [] for m in metrics}
+        headers  = []
+
+        for col, block in self._meta.items():
+            ns = block.get("statistics", {}).get("numeric_summary")
+            if ns:
+                headers.append(col)
+                for m in metrics:
+                    rows[m].append(ns.get(m, np.nan))
+
+        if not headers:
+            if message:
+                print("No numeric_summary stored in YAML; run metadata.update() primero.")
+            return None
+
+        df_desc = (pd.DataFrame.from_dict(rows, orient="index", columns=headers)
+                            .astype(float)
+                            .round(3))
+        if message:
+            print(df_desc)
+        return df_desc
+
+
+    def show(self,
+             column: Optional[str] = None,
+             *,
+             fields: Sequence[str] = ("identity.label_i18n",
+                                      "type.logical_type",
+                                      "domain",
+                                      "statistics")) -> None:
+        self._ensure_loaded()
+
+        def _extract(d: Dict[str, Any], path: str):
+            for part in path.split("."):
+                d = d.get(part, {})
+            return d
+
+        cols = [column] if column else self._meta.keys()
+        for col in cols:
+            block = self._meta[col]
+            print(f"── {col}")
+            for f in fields:
+                print(f"  {f}: {_extract(block, f)}")
+            print("")
+
+    def filter(self,
+               *,
+               logical_type: Optional[Union[str, Sequence[str]]] = None,
+               tag: Optional[str] = None,
+               name_regex: Optional[str] = None,
+               has_domain: bool = False) -> pd.DataFrame:
+        """Devuelve un DataFrame resumen de columnas que cumplan criterios."""
+        self._ensure_loaded()
+        ltypes = {logical_type} if isinstance(logical_type, str) else set(logical_type or [])
+        rows: List[Dict[str, Any]] = []
+        for col, block in self._meta.items():
+            if ltypes and block["type"]["logical_type"] not in ltypes:
+                continue
+            if tag and tag not in block["identity"].get("tags", []):
+                continue
+            if name_regex and not re.search(name_regex, col):
+                continue
+            if has_domain and not block.get("domain"):
+                continue
+            rows.append({
+                "column":       col,
+                "logical_type": block["type"]["logical_type"],
+                "description":  block["identity"]["description_i18n"].get("es")
+                                  or block["identity"]["description_i18n"].get("en", ""),
+                "tags":         ", ".join(block["identity"].get("tags", []))
+            })
+        return pd.DataFrame(rows)
