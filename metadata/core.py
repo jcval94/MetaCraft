@@ -17,6 +17,7 @@ import warnings
 import zipfile
 import urllib.request
 import urllib.parse
+import logging
 from urllib.error import URLError
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -25,6 +26,14 @@ import numpy as np
 import pandas as pd
 import yaml
 from pandas.api.types import CategoricalDtype
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
 
 # ---------- dependencias opcionales ----------
 try:
@@ -303,12 +312,21 @@ def _from_frame(df: pd.DataFrame, *, sep: str = ".") -> Dict[str, Dict[str, Any]
 class Metadata:
     """Objeto principal para gestionar y validar metadatos."""
 
-    def __init__(self, cache_dir: Optional[Union[str, pathlib.Path]] = None) -> None:
+    def __init__(
+        self,
+        cache_dir: Optional[Union[str, pathlib.Path]] = None,
+        *,
+        loglevel: Union[str, int] = "INFO",
+    ) -> None:
         self._meta: Dict[str, Dict[str, Any]] = {}
         self._df_cache: Optional[pd.DataFrame] = None
         self._df_prev: Optional[pd.DataFrame] = None
         self._history: Dict[str, Dict[str, Any]] = {}
         self._cache_dir = pathlib.Path(cache_dir) if cache_dir else None
+        self.logger = logger
+        if isinstance(loglevel, str):
+            loglevel = getattr(logging, loglevel.upper(), logging.INFO)
+        self.logger.setLevel(loglevel)
         if self._cache_dir:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file = self._cache_dir / "df_cache.pkl"
@@ -382,7 +400,7 @@ class Metadata:
                         block = _process_meta_block(block, df[col_df], hll_p, verbose)
                     else:
                         if verbose:
-                            warnings.warn(f"[update] '{col_yaml}' no tiene columna equivalente en el DataFrame.")
+                            self.logger.warning("[update] '%s' no tiene columna equivalente en el DataFrame.", col_yaml)
                     new_schema.append(block)
                     aggregated[col_yaml] = block
                 meta["schema"] = new_schema
@@ -395,7 +413,7 @@ class Metadata:
                 meta = _process_meta_block(meta, df[col_df], hll_p, verbose)
             else:
                 if verbose:
-                    warnings.warn(f"[update] Columna '{col_yaml}' no encontrada en el DataFrame.")
+                    self.logger.warning("[update] Columna '%s' no encontrada en el DataFrame.", col_yaml)
             aggregated[col_yaml] = meta
             return meta
 
@@ -415,7 +433,7 @@ class Metadata:
                 if inplace:
                     raise RuntimeError("No se puede sobrescribir un recurso HTTP; usa inplace=False.")
                 if verbose:
-                    print(f"[update] Descargando {meta_source}...")
+                    self.logger.info("[update] Descargando %s...", meta_source)
                 try:
                     with urllib.request.urlopen(str(meta_source)) as resp:
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
@@ -453,7 +471,7 @@ class Metadata:
                 for fname, data in updated.items():
                     zout.writestr(fname, data)
             if verbose:
-                print(f"✔ ZIP escrito en {dst_zip}")
+                self.logger.info("✔ ZIP escrito en %s", dst_zip)
             if tmp_path is not None:
                 try:
                     os.remove(tmp_path)
@@ -477,7 +495,7 @@ class Metadata:
 
                 _save_meta(meta, dest)
                 if verbose:
-                    print(f"✔ {dest} actualizado")
+                    self.logger.info("✔ %s actualizado", dest)
 
         # -------- snapshot interno + df cache --------
         self._meta = aggregated
@@ -523,26 +541,26 @@ class Metadata:
 
     def printSchema(self) -> None:
         self._ensure_loaded()
-        print("root")
+        self.logger.info("root")
         for col, block in self._meta.items():
             dtype = block["type"]["logical_type"]
             nullable = block.get("domain", {}).get("allowed_nulls_pct", 0) > 0
-            print(f" |-- {col}: {dtype} (nullable = {str(nullable).lower()})")
+            self.logger.info(" |-- %s: %s (nullable = %s)", col, dtype, str(nullable).lower())
 
     def info(self) -> None:
         self._ensure_loaded()
-        print("<class 'metadata.dataset'>")
-        print(f"Columns: {len(self._meta)} entries")
-        print(" #   Column            Non-Null Count   Dtype")
-        print("---  ------            --------------   -----")
+        self.logger.info("<class 'metadata.dataset'>")
+        self.logger.info("Columns: %d entries", len(self._meta))
+        self.logger.info(" #   Column            Non-Null Count   Dtype")
+        self.logger.info("---  ------            --------------   -----")
         dtype_counts: Dict[str, int] = {}
         for i, (col, block) in enumerate(self._meta.items()):
             stats = block.get("statistics", {})
             nn = stats.get("n_non_null", "‑‑")
             dtype = block["type"]["logical_type"]
-            print(f"{i:>2}   {col:<18} {nn:>14}   {dtype}")
+            self.logger.info("%2d   %-18s %14s   %s", i, col, nn, dtype)
             dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
-        print("dtypes:", ", ".join(f"{k}({v})" for k, v in dtype_counts.items()))
+        self.logger.info("dtypes: %s", ", ".join(f"{k}({v})" for k, v in dtype_counts.items()))
 
     # ------------------------------------------------------------------
     #                            VALIDATE
@@ -574,7 +592,7 @@ class Metadata:
                 if self._df_cache is not None and y in self._df_cache.index:
                     self._df_cache.rename(index={y: d}, inplace=True)
             if fixes and message:
-                print(f"[FIXED] Columnas actualizadas en YAML: {list(fixes.items())}")
+                self.logger.info("[FIXED] Columnas actualizadas en YAML: %s", list(fixes.items()))
             yaml_cols = set(self._meta.keys())
 
         # ---------- checks originales ----------
@@ -584,9 +602,9 @@ class Metadata:
             passed = False
             if message:
                 if missing:
-                    print(f"[MISSING] Columnas faltantes en DF: {sorted(missing)}")
+                    self.logger.info("[MISSING] Columnas faltantes en DF: %s", sorted(missing))
                 if extra:
-                    print(f"[EXTRA]   Columnas no esperadas en DF: {sorted(extra)}")
+                    self.logger.info("[EXTRA]   Columnas no esperadas en DF: %s", sorted(extra))
 
         common = yaml_cols & df_cols
         for col in common:
@@ -598,7 +616,7 @@ class Metadata:
             if logic_real != logic_yaml:
                 passed = False
                 if message:
-                    print(f"[TYPE] {col}: {logic_real} != {logic_yaml}")
+                    self.logger.info("[TYPE] %s: %s != %s", col, logic_real, logic_yaml)
 
             # --- detalle 1 ---
             if detail >= 1:
@@ -608,11 +626,11 @@ class Metadata:
                     if lo is not None and series.min() < lo - 1e-9:
                         passed = False
                         if message:
-                            print(f"[RANGE] {col}: min {series.min()} < {lo}")
+                            self.logger.info("[RANGE] %s: min %s < %s", col, series.min(), lo)
                     if hi is not None and series.max() > hi + 1e-9:
                         passed = False
                         if message:
-                            print(f"[RANGE] {col}: max {series.max()} > {hi}")
+                            self.logger.info("[RANGE] %s: max %s > %s", col, series.max(), hi)
                 if "categorical" in dom and dom["categorical"].get("closed"):
                     allowed = set(dom["categorical"].get("codes", [])) | set(
                         dom["categorical"].get("labels", {}).values()
@@ -622,7 +640,7 @@ class Metadata:
                         passed = False
                         if message:
                             sample = invalid.unique()[:5]
-                            print(f"[DOMAIN] {col}: {len(invalid)} invalid → {sample}")
+                            self.logger.info("[DOMAIN] %s: %d invalid -> %s", col, len(invalid), sample)
                 if pattern := dom.get("pattern"):
                     bad = series.dropna().astype(str).loc[
                         ~series.dropna().astype(str).str.match(pattern)
@@ -630,7 +648,7 @@ class Metadata:
                     if not bad.empty:
                         passed = False
                         if message:
-                            print(f"[PATTERN] {col}: {len(bad)} no cumplen /{pattern}/")
+                            self.logger.info("[PATTERN] %s: %d no cumplen /%s/", col, len(bad), pattern)
 
             # --- detalle 2 ---
             if detail >= 2:
@@ -639,13 +657,13 @@ class Metadata:
                 if mr > allowed_null + 1e-9:
                     passed = False
                     if message:
-                        print(f"[NULLS] {col}: {mr:.2%} > {allowed_null:.2%}")
+                        self.logger.info("[NULLS] %s: %.2f%% > %.2f%%", col, mr*100, allowed_null*100)
                 if block.get("domain", {}).get("unique"):
                     dups = series.duplicated().sum()
                     if dups:
                         passed = False
                         if message:
-                            print(f"[UNIQUE] {col}: {dups} duplicados")
+                            self.logger.info("[UNIQUE] %s: %d duplicados", col, dups)
         return passed
 
     # ------------------------------------------------------------------
@@ -679,19 +697,21 @@ class Metadata:
             missing = set(a).symmetric_difference(b)
             passed = False
             if message:
-                print(f"[COLUMNS] sets differ: {missing}")
+                self.logger.info("[COLUMNS] sets differ: %s", missing)
 
         for col in set(a) & set(b):
             if a[col]["type"]["logical_type"] != b[col]["type"]["logical_type"]:
                 passed = False
                 if message:
-                    print(f"[TYPE] {col}: {a[col]['type']['logical_type']} → {b[col]['type']['logical_type']}")
+                    self.logger.info("[TYPE] %s: %s -> %s", col, a[col]['type']['logical_type'], b[col]['type']['logical_type'])
             if a[col]["type"].get("measurement_scale") != b[col]["type"].get("measurement_scale"):
                 passed = False
                 if message:
-                    print(
-                        f"[SCALE] {col}: {a[col]['type'].get('measurement_scale')} → "
-                        f"{b[col]['type'].get('measurement_scale')}"
+                    self.logger.info(
+                        "[SCALE] %s: %s -> %s",
+                        col,
+                        a[col]['type'].get('measurement_scale'),
+                        b[col]['type'].get('measurement_scale'),
                     )
 
         if detail >= 1:
@@ -702,7 +722,7 @@ class Metadata:
                     if diff > drift_threshold:
                         passed = False
                         if message:
-                            print(f"[DRIFT] {col}.{k} Δ={diff:.2%}")
+                            self.logger.info("[DRIFT] %s.%s Δ=%.2f%%", col, k, diff*100)
                 if "numeric_summary" in sa and "numeric_summary" in sb:
                     for p in ("p50", "p95"):
                         base = sa["numeric_summary"][p] or 1e-9
@@ -710,7 +730,7 @@ class Metadata:
                         if diff > drift_threshold:
                             passed = False
                             if message:
-                                print(f"[DRIFT] {col}.{p} Δ={diff:.2%}")
+                                self.logger.info("[DRIFT] %s.%s Δ=%.2f%%", col, p, diff*100)
         return passed
 
     # ------------------------------------------------------------------
@@ -779,7 +799,7 @@ class Metadata:
         if df is None:
             df = self._df_cache
             if df is None:
-                warnings.warn("[quality_report] No DataFrame en caché ni provisto.")
+                self.logger.warning("[quality_report] No DataFrame en caché ni provisto.")
 
         df_val = df if df is not None else pd.DataFrame({})
         comp_pass = self.validate(df_val, detail=2, message=False)
@@ -795,7 +815,7 @@ class Metadata:
                  "C" if score >= 60 else
                  "D" if score >= 40 else "F")
         if message:
-            print(f"Quality score: {score:.1f} ({grade})")
+            self.logger.info("Quality score: %.1f (%s)", score, grade)
         return {"score": score, "grade": grade}
 
     def _coerce(self, series: pd.Series, logic: str):
@@ -885,7 +905,7 @@ class Metadata:
         self._ensure_loaded()
         if df is not None and require_valid and not self.validate(df, detail=detail, message=message):
             if message:
-                print("❌  describe() abortado: metadata.validate() no pasó.")
+                self.logger.info("❌  describe() abortado: metadata.validate() no pasó.")
             return None
 
         metrics  = ["count", "mean", "std", "min", "p25", "p50", "p75", "p95", "max"]
@@ -901,14 +921,14 @@ class Metadata:
 
         if not headers:
             if message:
-                print("No numeric_summary stored in YAML; run metadata.update() primero.")
+                self.logger.info("No numeric_summary stored in YAML; run metadata.update() primero.")
             return None
 
         df_desc = (pd.DataFrame.from_dict(rows, orient="index", columns=headers)
                             .astype(float)
                             .round(3))
         if message:
-            print(df_desc)
+            self.logger.info("%s", df_desc)
         return df_desc
 
 
@@ -929,10 +949,10 @@ class Metadata:
         cols = [column] if column else self._meta.keys()
         for col in cols:
             block = self._meta[col]
-            print(f"── {col}")
+            self.logger.info("\u2500\u2500 %s", col)
             for f in fields:
-                print(f"  {f}: {_extract(block, f)}")
-            print("")
+                self.logger.info("  %s: %s", f, _extract(block, f))
+            self.logger.info("")
 
     def filter(self,
                *,
