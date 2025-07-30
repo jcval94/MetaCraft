@@ -2,7 +2,7 @@ import pandas as pd
 import yaml
 from pathlib import Path
 
-from metadata import Metadata
+from metacraft import Metadata
 
 
 def test_df_upgrade_updates_meta(tmp_path):
