@@ -100,13 +100,14 @@ m.df.loc['age', 'identity.description_i18n.es'] = 'Edad del pasajero'
 m.df.loc['age', ['domain.numeric.min', 'domain.numeric.max']] = [0, 120]
 
 m.df.upgrade('schema.yaml')  # guarda el YAML actualizado
+m.df.revert()                # descarta los cambios en memoria
 ```
 
 ## Roadmap
 
 - ✔️ Soporte de YAML remoto (v 2025‑07‑30)
 - ✔️ Descarga de ZIP remotos (v 2025‑07‑30)
-- ⬜ Caché local opcional
+- ✔️ Caché local opcional
 - ⬜ CLI (`metadata-cli update titanic.csv titanic.yaml`)
 
 ## Generador de metadatos
