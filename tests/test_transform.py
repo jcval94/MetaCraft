@@ -6,7 +6,7 @@ import numpy as np
 from pandas.testing import assert_series_equal
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from metadata import Metadata
+from metacraft import Metadata
 
 
 def test_transform_fillna_dict_missing_key():

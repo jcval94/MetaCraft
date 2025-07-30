@@ -1,6 +1,6 @@
-# Metadata Toolkit
+# MetaCraft Toolkit
 
-`metadata` es un paquete de Python para enriquecer y validar esquemas YAML a partir de un `pandas.DataFrame`. Ahora `metadata.update()` permite leer YAML directamente desde URLs, e incluso descargar ZIP remotos con varios esquemas, igual que `pandas.read_csv`.
+`MetaCraft` es un paquete de Python para enriquecer y validar esquemas YAML a partir de un `pandas.DataFrame`. Ahora `metadata.update()` permite leer YAML directamente desde URLs, e incluso descargar ZIP remotos con varios esquemas, igual que `pandas.read_csv`.
 
 ## Características
 
@@ -17,7 +17,7 @@
 ## Instalación
 
 ```bash
-pip install Metadata
+pip install MetaCraft
 ```
 
 O bien desde el repositorio:
@@ -32,7 +32,7 @@ Dependencias opcionales: `openai`, `tdigest`, `datasketch`.
 
 ```python
 import pandas as pd
-from metadata import Metadata
+from metacraft import Metadata
 
 # DataFrame de ejemplo
  df = pd.DataFrame({

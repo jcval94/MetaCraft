@@ -5,7 +5,7 @@ import yaml
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from metadata import Metadata
+from metacraft import Metadata
 
 
 def test_update_reads_json(tmp_path):

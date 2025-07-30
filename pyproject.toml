@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Metadata"
+name = "MetaCraft"
 version = "2025.7.30"
 description = "Toolkit to enrich, validate and explore YAML metadata from a pandas DataFrame."
 readme = "README.md"
@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://example.com/Metadata"
+Homepage = "https://example.com/MetaCraft"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["metadata"]
+include = ["metacraft"]

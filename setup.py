@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="Metadata",
+    name="MetaCraft",
     version="2025.7.30",
     description="Toolkit to enrich, validate and explore YAML metadata from a pandas DataFrame.",
     long_description=open("README.md", encoding="utf-8").read(),
@@ -19,6 +19,6 @@ setup(
         "datasketch>=1.5",
     ],
     project_urls={
-        "Homepage": "https://example.com/Metadata",
+        "Homepage": "https://example.com/MetaCraft",
     },
 )
