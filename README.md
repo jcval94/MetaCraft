@@ -1,6 +1,6 @@
 # Metadata Toolkit
 
-`metadata` es un paquete de Python para enriquecer y validar esquemas YAML a partir de un `pandas.DataFrame`. Ahora `metadata.update()` permite leer YAML directamente desde URLs, igual que `pandas.read_csv`.
+`metadata` es un paquete de Python para enriquecer y validar esquemas YAML a partir de un `pandas.DataFrame`. Ahora `metadata.update()` permite leer YAML directamente desde URLs, e incluso descargar ZIP remotos con varios esquemas, igual que `pandas.read_csv`.
 
 ## Características
 
@@ -75,10 +75,19 @@ Validation passed: True
 Quality score: 100.0 (A)
 ```
 
+### Ejemplo con ZIP remoto
+
+`metadata.update()` también puede procesar archivos ZIP alojados en la web. Basta con pasar la URL que termine en `.zip`:
+
+```python
+m.update(df, 'https://ejemplo.com/esquemas.zip', verbose=True)
+```
+Esto descargará el ZIP a un directorio temporal, aplicará las actualizaciones y dejará el archivo resultante en la misma carpeta (o en la ruta indicada con `output`).
+
 ## Roadmap
 
 - ✔️ Soporte de YAML remoto (v 2025‑07‑30)
-- ⬜ Descarga de ZIP remotos
+- ✔️ Descarga de ZIP remotos (v 2025‑07‑30)
 - ⬜ Caché local opcional
 - ⬜ CLI (`metadata-cli update titanic.csv titanic.yaml`)
 
