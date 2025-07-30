@@ -68,6 +68,27 @@ def _read_yaml(src: Union[str, pathlib.Path]) -> Dict[str, Any]:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def _read_json(src: Union[str, pathlib.Path]) -> Dict[str, Any]:
+    """Lee un JSON local o remoto y lo devuelve como dict."""
+    if _is_url(src):
+        with urllib.request.urlopen(str(src)) as resp:
+            data = resp.read().decode("utf-8")
+        return json.loads(data)
+    else:
+        path = pathlib.Path(src)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_meta(src: Union[str, pathlib.Path]) -> Dict[str, Any]:
+    """Lectura unificada de YAML o JSON."""
+    lower = str(src).lower()
+    if lower.endswith(".json"):
+        return _read_json(src)
+    return _read_yaml(src)
+
+
 def _tdigest_b64(series: pd.Series) -> Optional[str]:
     if TDigest is None or not pd.api.types.is_numeric_dtype(series):
         return None
@@ -347,10 +368,15 @@ class Metadata:
             updated: Dict[str, bytes] = {}
             with zipfile.ZipFile(src_zip, "r") as zin:
                 for fname in zin.namelist():
-                    if not fname.lower().endswith((".yml", ".yaml")):
+                    lower = fname.lower()
+                    if not lower.endswith((".yml", ".yaml", ".json")):
                         updated[fname] = zin.read(fname)
                         continue
-                    meta = yaml.safe_load(zin.read(fname).decode())
+                    data = zin.read(fname).decode()
+                    if lower.endswith(".json"):
+                        meta = json.loads(data)
+                    else:
+                        meta = yaml.safe_load(data)
                     meta = _handle_meta(meta)
                     updated[fname] = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).encode()
 
@@ -374,7 +400,7 @@ class Metadata:
         else:
             files = [meta_source] if isinstance(meta_source, (str, pathlib.Path)) else meta_source
             for src in files:
-                meta = _read_yaml(src)
+                meta = _read_meta(src)
                 meta = _handle_meta(meta)
 
                 if _is_url(src):  # ---------- Fuente remota (solo lectura) ----------
