@@ -109,4 +109,8 @@ m.df.upgrade('schema.yaml')  # guarda el YAML actualizado
 - ⬜ Caché local opcional
 - ⬜ CLI (`metadata-cli update titanic.csv titanic.yaml`)
 
+## Generador de metadatos
+
+Puedes probar el [Generador de metadatos](https://chatgpt.com/g/g-68807807e1a4819189df3d0023a6e429-generador-de-metadatos), un GPT que crea el YAML a partir de un `.head`.
+
 ¡Contribuciones bienvenidas!
