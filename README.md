@@ -1,46 +1,46 @@
 # MetaCraft Toolkit
 
-`MetaCraft` es un paquete de Python para enriquecer y validar esquemas YAML a partir de un `pandas.DataFrame`. Ahora `metadata.update()` permite leer YAML directamente desde URLs, e incluso descargar ZIP remotos con varios esquemas, igual que `pandas.read_csv`.
+`MetaCraft` is a Python package for enriching and validating YAML schemas from a `pandas.DataFrame`. The `metadata.update()` function can now read YAML directly from URLs and even download remote ZIP files with multiple schemas, just like `pandas.read_csv`.
 
-## Características
+## Features
 
-- **update**: enriquece YAML con estadísticas, *sketches* (`tdigest`, `HyperLogLog`) y deja los resultados en `metadata.df`.
-- **validate**: comprueba la coherencia entre un DataFrame y el YAML (tipos, rangos, nulos...).
-- **compare**: detecta *schema drift* entre dos esquemas.
-- **export_schema**: convierte el YAML a otros formatos (Spark, SQL, etc.).
-- **generate_expectations**: crea suites de *Great Expectations*.
-- **transform**: devuelve un DataFrame ajustado al esquema.
-- **quality_report**: puntaje sencillo de calidad (completitud + *drift*).
-- **research**: usa OpenAI para explorar relaciones y anomalías.
-- **loglevel**: controla la verbosidad vía `Metadata(loglevel="DEBUG")`.
+- **update**: enriches YAML with statistics and sketches (`tdigest`, `HyperLogLog`), storing the results in `metadata.df`.
+- **validate**: checks the consistency between a DataFrame and the YAML (types, ranges, nulls, ...).
+- **compare**: detects schema drift between two schemas.
+- **export_schema**: converts the YAML to other formats (Spark, SQL, etc.).
+- **generate_expectations**: creates Great Expectations suites.
+- **transform**: returns a DataFrame adjusted to the schema.
+- **quality_report**: simple quality score (completeness + drift).
+- **research**: uses OpenAI to explore relationships and anomalies.
+- **loglevel**: controls verbosity via `Metadata(loglevel="DEBUG")`.
 
-## Instalación
+## Installation
 
 ```bash
 pip install MetaCraft
 ```
 
-O bien desde el repositorio:
+Or from the repository:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Dependencias opcionales: `openai`, `tdigest`, `datasketch`.
+Optional dependencies: `openai`, `tdigest`, `datasketch`.
 
-## Ejemplo rápido
+## Quick example
 
 ```python
 import pandas as pd
 from metacraft import Metadata
 
-# DataFrame de ejemplo
- df = pd.DataFrame({
-     'survived': [0, 1, 1, 0],
-     'age': [22, 38, 26, 35],
- })
+# Example DataFrame
+df = pd.DataFrame({
+    'survived': [0, 1, 1, 0],
+    'age': [22, 38, 26, 35],
+})
 
-# Esquema mínimo
+# Minimal schema
 yaml_schema = {
     'schema': [
         {'identity': {'name': 'survived'}},
@@ -48,7 +48,7 @@ yaml_schema = {
     ]
 }
 
-# Guardamos el YAML en disco
+# Save YAML to disk
 import yaml
 with open('schema.yaml', 'w') as f:
     yaml.safe_dump(yaml_schema, f, sort_keys=False, allow_unicode=True)
@@ -58,10 +58,10 @@ m.update(df, 'schema.yaml', inplace=True)
 m.quality_report(df)
 ```
 
-### Resultados
+### Results
 
 ```text
-✔ schema.yaml actualizado
+✔ schema.yaml updated
 root
  |-- survived: integer (nullable = false)
  |-- age: integer (nullable = false)
@@ -76,43 +76,43 @@ Validation passed: True
 Quality score: 100.0 (A)
 ```
 
-### Ejemplo con ZIP remoto
+### Remote ZIP example
 
-`metadata.update()` también puede procesar archivos ZIP alojados en la web. Basta con pasar la URL que termine en `.zip`:
+`metadata.update()` can also process ZIP files hosted on the web. Just pass a URL ending in `.zip`:
 
 ```python
-m.update(df, 'https://ejemplo.com/esquemas.zip', verbose=True)
+m.update(df, 'https://example.com/schemas.zip', verbose=True)
 ```
-Esto descargará el ZIP a un directorio temporal, aplicará las actualizaciones y dejará el archivo resultante en la misma carpeta (o en la ruta indicada con `output`).
+This downloads the ZIP to a temporary directory, applies the updates and leaves the resulting file in the same folder (or in the path provided with `output`).
 
-### Edición de metadatos vía `metadata.df`
+### Editing metadata via `metadata.df`
 
-Tras `m.update()` el esquema queda en `m.df`, un DataFrame editable. Los cambios
-pueden propagarse al YAML con `m.df.upgrade()`:
+After `m.update()` the schema lives in `m.df`, an editable DataFrame. Changes
+can be propagated back to YAML with `m.df.upgrade()`:
 
 ```python
-# 1) Si todas las columnas son enteros
+# 1) If all columns are integers
 m.df['type.logical_type'] = 'integer'
 
-# 2) Cambiar la descripción de `age`
-m.df.loc['age', 'identity.description_i18n.es'] = 'Edad del pasajero'
+# 2) Change the description of `age`
+m.df.loc['age', 'identity.description_i18n.es'] = 'Passenger age'
 
-# 3) Ajustar el rango permitido de `age`
+# 3) Adjust the allowed range for `age`
 m.df.loc['age', ['domain.numeric.min', 'domain.numeric.max']] = [0, 120]
 
-m.df.upgrade('schema.yaml')  # guarda el YAML actualizado
-m.df.revert()                # descarta los cambios en memoria
+m.df.upgrade('schema.yaml')  # save the updated YAML
+m.df.revert()                # discard the changes in memory
 ```
 
 ## Roadmap
 
-- ✔️ Soporte de YAML remoto (v 2025‑07‑30)
-- ✔️ Descarga de ZIP remotos (v 2025‑07‑30)
-- ✔️ Caché local opcional
+- ✔️ Remote YAML support (v 2025‑07‑30)
+- ✔️ Remote ZIP download (v 2025‑07‑30)
+- ✔️ Optional local cache
 - ⬜ CLI (`metadata-cli update titanic.csv titanic.yaml`)
 
-## Generador de metadatos
+## Metadata generator
 
-Puedes probar el [Generador de metadatos](https://chatgpt.com/g/g-68807807e1a4819189df3d0023a6e429-generador-de-metadatos), un GPT que crea el YAML a partir de un `.head`.
+You can try the [Metadata Generator](https://chatgpt.com/g/g-68807807e1a4819189df3d0023a6e429-generador-de-metadatos), a GPT that creates the YAML from a `.head`.
 
-¡Contribuciones bienvenidas!
+Contributions welcome!
