@@ -303,10 +303,21 @@ def _from_frame(df: pd.DataFrame, *, sep: str = ".") -> Dict[str, Dict[str, Any]
 class Metadata:
     """Objeto principal para gestionar y validar metadatos."""
 
-    def __init__(self) -> None:
+    def __init__(self, cache_dir: Optional[Union[str, pathlib.Path]] = None) -> None:
         self._meta: Dict[str, Dict[str, Any]] = {}
         self._df_cache: Optional[pd.DataFrame] = None
+        self._df_prev: Optional[pd.DataFrame] = None
         self._history: Dict[str, Dict[str, Any]] = {}
+        self._cache_dir = pathlib.Path(cache_dir) if cache_dir else None
+        if self._cache_dir:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = self._cache_dir / "df_cache.pkl"
+            if cache_file.exists():
+                try:
+                    self._df_cache = pd.read_pickle(cache_file)
+                    self._attach_upgrade()
+                except Exception:
+                    self._df_cache = None
 
     def _attach_upgrade(self) -> None:
         if self._df_cache is None:
@@ -319,7 +330,26 @@ class Metadata:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 data = {"schema": list(self._meta.values())}
                 path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+            if self._cache_dir:
+                try:
+                    self._df_cache.to_pickle(self._cache_dir / "df_cache.pkl")
+                except Exception:
+                    pass
+
+        def revert() -> None:
+            if self._df_prev is None:
+                return
+            self._df_cache = self._df_prev.copy(deep=True)
+            self._df_prev = None
+            self._attach_upgrade()
+            if self._cache_dir:
+                try:
+                    self._df_cache.to_pickle(self._cache_dir / "df_cache.pkl")
+                except Exception:
+                    pass
+
         setattr(self._df_cache, "upgrade", upgrade)
+        setattr(self._df_cache, "revert", revert)
 
     # ------------------------------------------------------------------
     #                           UPDATE
@@ -451,8 +481,15 @@ class Metadata:
 
         # -------- snapshot interno + df cache --------
         self._meta = aggregated
+        if self._df_cache is not None:
+            self._df_prev = self._df_cache.copy(deep=True)
         self._df_cache = _to_frame(aggregated)
         self._attach_upgrade()
+        if self._cache_dir:
+            try:
+                self._df_cache.to_pickle(self._cache_dir / "df_cache.pkl")
+            except Exception:
+                pass
         setattr(self, "_df_cache", self._df_cache)
 
     # ------------------------------------------------------------------
@@ -464,14 +501,24 @@ class Metadata:
 
     @property
     def df(self) -> Optional[pd.DataFrame]:
-        if self._df_cache is not None and not hasattr(self._df_cache, "upgrade"):
-            self._attach_upgrade()
+        if self._df_cache is not None:
+            if not hasattr(self._df_cache, "upgrade"):
+                self._attach_upgrade()
+            if self._df_prev is None:
+                self._df_prev = self._df_cache.copy(deep=True)
         return self._df_cache
 
     def to_frame(self, *, flat: bool = True, sep: str = ".") -> pd.DataFrame:
         df = _to_frame(self._meta, flat=flat, sep=sep)
+        if self._df_cache is not None:
+            self._df_prev = self._df_cache.copy(deep=True)
         self._df_cache = df
         self._attach_upgrade()
+        if self._cache_dir:
+            try:
+                self._df_cache.to_pickle(self._cache_dir / "df_cache.pkl")
+            except Exception:
+                pass
         return df
 
     def printSchema(self) -> None:
