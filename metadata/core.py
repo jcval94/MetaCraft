@@ -684,8 +684,12 @@ class Metadata:
             if coerce_types:
                 df2[col] = self._coerce(df2[col], block["type"]["logical_type"])
             if fillna is not None:
-                value = fillna[col] if isinstance(fillna, dict) else fillna
-                df2[col] = df2[col].fillna(value)
+                value = fillna.get(col) if isinstance(fillna, dict) else fillna
+                if value is not None:
+                    if isinstance(df2[col].dtype, CategoricalDtype):
+                        if value not in df2[col].cat.categories:
+                            df2[col] = df2[col].cat.add_categories([value])
+                    df2[col] = df2[col].fillna(value)
         if drop_extra:
             extra = set(df2.columns) - set(self._meta.keys())
             df2 = df2.drop(columns=list(extra))
