@@ -12,6 +12,7 @@
 - **transform**: devuelve un DataFrame ajustado al esquema.
 - **quality_report**: puntaje sencillo de calidad (completitud + *drift*).
 - **research**: usa OpenAI para explorar relaciones y anomalías.
+- **loglevel**: controla la verbosidad vía `Metadata(loglevel="DEBUG")`.
 
 ## Instalación
 
@@ -52,7 +53,7 @@ import yaml
 with open('schema.yaml', 'w') as f:
     yaml.safe_dump(yaml_schema, f, sort_keys=False, allow_unicode=True)
 
-m = Metadata()
+m = Metadata(loglevel="INFO")
 m.update(df, 'schema.yaml', inplace=True)
 m.quality_report(df)
 ```
