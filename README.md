@@ -1,7 +1,8 @@
 # Metadata Toolkit (2025‑07‑30)
 
-`metadata.py` es un módulo **todo‑en‑uno** para enriquecer, validar y explotar
-esquemas YAML de metadatos a partir de un `pandas.DataFrame`.
+`metadata` es un paquete Python que ofrece un módulo `core` con la clase
+`Metadata` para enriquecer, validar y explotar esquemas YAML a partir de un
+`pandas.DataFrame`.
 
 \*️⃣ **Novedad:** `metadata.update()` ahora acepta rutas HTTP/HTTPS del mismo modo
 que `pandas.read_csv`, por lo que puedes trabajar con archivos YAML alojados en
@@ -28,7 +29,12 @@ GitHub Raw u otros servidores estáticos.
 ## Instalación rápida
 
 ```bash
-# 1. clona tu repo o copia metadata.py en tu proyecto
+pip install Metadata
+```
+
+Si prefieres trabajar desde una copia local del repositorio:
+
+```bash
 pip install -r requirements.txt
 ```
 
@@ -42,6 +48,18 @@ pip install -r requirements.txt
 
 ```bash
 pip install openai tdigest datasketch
+```
+
+## Estructura del proyecto
+
+```
+metadata/       # paquete principal
+├─ __init__.py  # expone la clase Metadata
+└─ core.py      # implementación original del módulo
+LICENSE
+pyproject.toml
+requirements.txt
+README.md
 ```
 
 ---
