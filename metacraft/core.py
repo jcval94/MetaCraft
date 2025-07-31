@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import tempfile
+import copy
 import unicodedata
 import warnings
 import zipfile
@@ -861,12 +862,12 @@ class Metadata:
 
     def snapshot(self, label: str) -> None:
         self._ensure_loaded()
-        self._history[label] = {k: v.copy() for k, v in self._meta.items()}
+        self._history[label] = copy.deepcopy(self._meta)
 
     def load_snapshot(self, label: str) -> None:
         if label not in self._history:
             raise KeyError(label)
-        self._meta = {k: v.copy() for k, v in self._history[label].items()}
+        self._meta = copy.deepcopy(self._history[label])
 
     def list_snapshots(self) -> List[str]:
         return list(self._history.keys())
