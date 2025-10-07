@@ -23,6 +23,12 @@ from urllib.error import URLError
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+_DEFAULT_OPENAI_CALL_PARAMS: Dict[str, Any] = {
+    "model": "gpt-4o-mini",
+    "temperature": 0.1,
+    "max_tokens": 800,
+}
+
 import numpy as np
 import pandas as pd
 import yaml
@@ -134,21 +140,83 @@ def _infer_logic(series: pd.Series) -> str:
     return "string"
 
 
-def _call_openai(prompt: str, *, model: str = "gpt-4o-mini", max_tokens: int = 800) -> str:
-    """Encapsula la llamada; falla si openai no está instalado o no hay key."""
-    if (openai is None) or (not os.getenv("OPENAI_API_KEY")):
+def _extract_openai_content(choice: Any) -> str:
+    """Obtiene el contenido del primer mensaje sin importar la versión del SDK."""
+    if choice is None:
+        raise RuntimeError("Respuesta OpenAI sin contenido.")
+
+    if isinstance(choice, dict):
+        if "message" in choice and isinstance(choice["message"], dict):
+            content = choice["message"].get("content")
+            if content:
+                return str(content).strip()
+        if "text" in choice and choice["text"]:
+            return str(choice["text"]).strip()
+
+    message = getattr(choice, "message", None)
+    if isinstance(message, dict):
+        content = message.get("content")
+        if content:
+            return str(content).strip()
+    if message is not None and hasattr(message, "content"):
+        content = getattr(message, "content")
+        if content:
+            return str(content).strip()
+
+    text = getattr(choice, "text", None)
+    if text:
+        return str(text).strip()
+
+    raise RuntimeError("No se pudo extraer contenido de la respuesta de OpenAI.")
+
+
+def _call_openai(
+    prompt: str,
+    *,
+    api: Optional[Any] = None,
+    api_key: Optional[str] = None,
+    request_params: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Encapsula la llamada, permitiendo inyectar un cliente OpenAI personalizado."""
+    client = api or openai
+    if client is None:
         raise RuntimeError("OpenAI API no disponible.")
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    rsp = openai.ChatCompletion.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a helpful data assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=max_tokens,
-    )
-    return rsp.choices[0].message.content.strip()
+
+    messages = [
+        {"role": "system", "content": "You are a helpful data assistant."},
+        {"role": "user", "content": prompt},
+    ]
+    kwargs: Dict[str, Any] = {**_DEFAULT_OPENAI_CALL_PARAMS, "messages": messages}
+
+    if request_params:
+        kwargs.update(request_params)
+    kwargs.setdefault("messages", messages)
+
+    chat_endpoint = getattr(getattr(client, "chat", None), "completions", None)
+    chat_create = getattr(chat_endpoint, "create", None)
+    if callable(chat_create):
+        response = chat_create(**kwargs)
+        choice = response.choices[0]
+        return _extract_openai_content(choice)
+
+    legacy_chat = getattr(client, "ChatCompletion", None)
+    legacy_create = getattr(legacy_chat, "create", None)
+    if callable(legacy_create):
+        key = api_key or getattr(client, "api_key", None) or os.getenv("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("OpenAI API no disponible.")
+        try:
+            setattr(client, "api_key", key)
+        except Exception:
+            pass
+        response = legacy_create(**kwargs)
+        if isinstance(response, dict):
+            choice = response["choices"][0]
+        else:
+            choice = response.choices[0]
+        return _extract_openai_content(choice)
+
+    raise RuntimeError("Cliente OpenAI no soportado.")
 
 
 # ╔════════════════════════════════════════════╗
@@ -317,19 +385,40 @@ def _from_frame(df: pd.DataFrame, *, sep: str = ".") -> Dict[str, Dict[str, Any]
 
 
 class Metadata:
-    """Objeto principal para gestionar y validar metadatos."""
+    """Objeto principal para gestionar y validar metadatos.
+
+    Parameters
+    ----------
+    cache_dir:
+        Carpeta opcional donde se almacenan snapshots y cachés.
+    loglevel:
+        Nivel de logging para el objeto.
+    openai_api:
+        Cliente o API key a utilizar para las funciones asistidas por OpenAI. Puede
+        ser una instancia del SDK oficial (`OpenAI` o módulo `openai`), una tupla
+        ``(cliente, api_key)`` o directamente una cadena con la API key.
+    openai_params:
+        Diccionario con los parámetros por defecto que se enviarán al endpoint de
+        chat de OpenAI (modelo, temperatura, etc.). Si es ``None`` se utilizan los
+        valores por defecto del paquete.
+    """
 
     def __init__(
         self,
         cache_dir: Optional[Union[str, pathlib.Path]] = None,
         *,
         loglevel: Union[str, int] = "INFO",
+        openai_api: Optional[Any] = None,
+        openai_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._meta: Dict[str, Dict[str, Any]] = {}
         self._df_cache: Optional[pd.DataFrame] = None
         self._df_prev: Optional[pd.DataFrame] = None
         self._history: Dict[str, Dict[str, Any]] = {}
         self._cache_dir = pathlib.Path(cache_dir) if cache_dir else None
+        self._openai_api: Optional[Any] = None
+        self._openai_api_key: Optional[str] = None
+        self._openai_params: Dict[str, Any] = dict(_DEFAULT_OPENAI_CALL_PARAMS)
         self.logger = logger
         if isinstance(loglevel, str):
             loglevel = getattr(logging, loglevel.upper(), logging.INFO)
@@ -343,6 +432,9 @@ class Metadata:
                     self._attach_upgrade()
                 except Exception:
                     self._df_cache = None
+        self.set_openai_api(openai_api)
+        if openai_params is not None:
+            self.set_openai_params(openai_params)
 
     def _attach_upgrade(self) -> None:
         if self._df_cache is None:
@@ -375,6 +467,52 @@ class Metadata:
 
         setattr(self._df_cache, "upgrade", upgrade)
         setattr(self._df_cache, "revert", revert)
+
+    def set_openai_api(self, openai_api: Optional[Any], *, api_key: Optional[str] = None) -> None:
+        """Permite configurar el cliente de OpenAI o la API key a utilizar."""
+        if isinstance(openai_api, tuple) and api_key is None:
+            if len(openai_api) != 2:
+                raise ValueError("Esperado tuple (cliente, api_key) para OpenAI.")
+            openai_api, api_key = openai_api  # type: ignore[assignment]
+
+        if isinstance(openai_api, str) and api_key is None:
+            api_key = openai_api
+            openai_api = openai
+
+        if openai_api is None and api_key is not None:
+            if openai is None:
+                raise RuntimeError("El paquete openai no está instalado.")
+            openai_api = openai
+
+        self._openai_api = openai_api
+        self._openai_api_key = api_key
+
+    def set_openai_params(self, params: Optional[Dict[str, Any]], *, merge: bool = False) -> None:
+        """Actualiza los parámetros por defecto para las llamadas a OpenAI."""
+        if params is None:
+            self._openai_params = dict(_DEFAULT_OPENAI_CALL_PARAMS)
+            return
+
+        if merge:
+            merged = dict(self._openai_params)
+            merged.update(params)
+            self._openai_params = merged
+        else:
+            updated = dict(_DEFAULT_OPENAI_CALL_PARAMS)
+            updated.update(params)
+            self._openai_params = updated
+
+    def _get_openai_client(self) -> Tuple[Any, Optional[str]]:
+        client = self._openai_api if self._openai_api is not None else openai
+        if client is None:
+            raise RuntimeError("OpenAI API no disponible.")
+        return client, self._openai_api_key
+
+    def _prepare_openai_params(self, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        params = dict(self._openai_params)
+        if overrides:
+            params.update(overrides)
+        return params
 
     # ------------------------------------------------------------------
     #                           UPDATE
@@ -777,8 +915,15 @@ class Metadata:
         Dialect: {dialect or 'generic'}. Style guide: {style_hint}. Return ONLY the artifact."""
         schema_yaml = yaml.safe_dump({"schema": list(self._meta.values())},
                                      sort_keys=False, allow_unicode=True)
-        return _call_openai(prompt + "\n\n---\n" + schema_yaml,
-                            model=llm_kwargs.get("model", "gpt-4o-mini"))
+        client, api_key = self._get_openai_client()
+        overrides = dict(llm_kwargs)
+        request_params = self._prepare_openai_params(overrides)
+        return _call_openai(
+            prompt + "\n\n---\n" + schema_yaml,
+            api=client,
+            api_key=api_key,
+            request_params=request_params,
+        )
 
     def generate_expectations(self,
                               framework: str = "great_expectations",
@@ -790,8 +935,15 @@ class Metadata:
         Include descriptions: {descriptive}. Return only the suite."""
         schema_yaml = yaml.safe_dump({"schema": list(self._meta.values())},
                                      sort_keys=False, allow_unicode=True)
-        return _call_openai(prompt + "\n\n---\n" + schema_yaml,
-                            model=llm_kwargs.get("model", "gpt-4o-mini"))
+        client, api_key = self._get_openai_client()
+        overrides = dict(llm_kwargs)
+        request_params = self._prepare_openai_params(overrides)
+        return _call_openai(
+            prompt + "\n\n---\n" + schema_yaml,
+            api=client,
+            api_key=api_key,
+            request_params=request_params,
+        )
 
     def quality_report(self,
                        df: Optional[pd.DataFrame] = None,
@@ -886,17 +1038,23 @@ class Metadata:
                  topics: Sequence[str] = ("correlations", "clusters", "anomalies"),
                  **llm_kwargs) -> Dict[str, Any]:
         self._ensure_loaded()
-        if openai is None or not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OpenAI API no disponible.")
         samp = df.sample(n=min(sample_rows, len(df)), random_state=42)
         csv_preview = samp.to_csv(index=False, max_cols=15, line_terminator="\n")[:40_000]
         prompt = f"""You are a senior data scientist.
         Topics requested: {', '.join(topics)}.
         Analyse the following CSV sample (header in first row).
         Return JSON with keys exactly {list(topics)}."""
-        analysis = _call_openai(prompt + "\n\n" + csv_preview,
-                                model=llm_kwargs.get("model", "gpt-4o-mini"),
-                                max_tokens=1200)
+        client, api_key = self._get_openai_client()
+        overrides = dict(llm_kwargs)
+        overrides.setdefault("temperature", temperature)
+        overrides.setdefault("max_tokens", 1200)
+        request_params = self._prepare_openai_params(overrides)
+        analysis = _call_openai(
+            prompt + "\n\n" + csv_preview,
+            api=client,
+            api_key=api_key,
+            request_params=request_params,
+        )
         try:
             return json.loads(analysis)
         except json.JSONDecodeError:

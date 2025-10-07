@@ -58,6 +58,30 @@ m.update(df, 'schema.yaml', inplace=True)
 m.quality_report(df)
 ```
 
+### Customising OpenAI usage
+
+`Metadata` can reuse an existing OpenAI client (or API key) and lets you define
+the exact parameters that will be sent to the chat endpoint. Provide default
+values through the constructor and override any of them per call:
+
+```python
+from openai import OpenAI
+from metacraft import Metadata
+
+client = OpenAI(api_key="sk-...")
+metadata = Metadata(
+    openai_api=client,
+    openai_params={"model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 600},
+)
+
+# Override defaults ad-hoc when exporting a schema
+spark_code = metadata.export_schema(
+    "spark",
+    response_format={"type": "text"},
+    max_tokens=900,
+)
+```
+
 ### Results
 
 ```text
