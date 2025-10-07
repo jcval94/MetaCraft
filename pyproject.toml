@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "MetaCraft"
-version = "2025.7.30"
+version = "2025.10.6"
 description = "Toolkit to enrich, validate and explore YAML metadata from a pandas DataFrame."
 readme = "README.md"
 requires-python = ">=3.8"

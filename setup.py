@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="MetaCraft",
-    version="2025.7.30",
+    version="2025.10.6",
     description="Toolkit to enrich, validate and explore YAML metadata from a pandas DataFrame.",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

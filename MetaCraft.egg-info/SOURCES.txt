@@ -9,6 +9,7 @@ MetaCraft.egg-info/requires.txt
 MetaCraft.egg-info/top_level.txt
 metacraft/__init__.py
 metacraft/core.py
+tests/test_extra.py
 tests/test_logging.py
 tests/test_quality.py
 tests/test_revert.py
