@@ -285,6 +285,12 @@ def _to_frame(meta_dict: Dict[str, Dict[str, Any]], *, flat: bool = True, sep: s
     recs = []
     for col, block in meta_dict.items():
         rec = _flatten(block, sep=sep) if flat else block.copy()
+        # ``InsideForest.metadata.run_experiments`` espera la columna ``rule_token``
+        # con el identificador de la regla original. Algunos flujos reutilizan
+        # ``Metadata.df`` (el DataFrame generado por ``_to_frame``) para alimentar
+        # dicho pipeline, por lo que añadimos esta llave explícita para mantener
+        # compatibilidad con esa API externa.
+        rec.setdefault("rule_token", col)
         rec["__column__"] = col
         recs.append(rec)
     return pd.DataFrame(recs).set_index("__column__")
